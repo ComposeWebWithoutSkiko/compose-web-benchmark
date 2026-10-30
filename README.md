@@ -88,6 +88,11 @@ to the server. It needs no setting of Safari changed. What differs from Chrome:
 Safari draws nothing in a window hidden behind another app's: while a page is hidden, the runner
 waits for it to be shown and measures it again. It brings Safari to the front only when it starts.
 
+## Results
+
+[`results/chrome.md`](results/chrome.md) has the tables measured in Chrome. Raw results are large
+and stay out of the repository: the commands below measure them again.
+
 ## Running it
 
 Requirements: JDK 17+, Node.js 22+, Google Chrome; for `runner/safari.mjs`, macOS and Safari.
