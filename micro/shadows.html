@@ -1,0 +1,565 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Shadows in Canvas 2D</title>
+    <style>
+        html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; }
+        canvas { display: block; width: 100%; height: 100%; }
+    </style>
+</head>
+<body>
+<canvas id="main"></canvas>
+<script>
+    // What it costs to draw elevation shadows in Canvas 2D: 40 rounded cards of 260x180 device
+    // pixels, each with an ambient and a spot shadow (two blurred copies of its shape), redrawn in
+    // every frame while a small square moves. `?variant=`:
+    //
+    // - none: the cards without shadows;
+    // - shadowBlur: each shadow drawn with ctx.shadowBlur (the shape moved far away, its shadow
+    //   offset back), as the renderer does now;
+    // - sprite: each shadow drawn from an image of the blurred shape, made once;
+    // - nineSlice: each shadow drawn as 9 pieces of an image of a blurred corner, made once, which
+    //   fits any size of the shape with the same corner radius and blur;
+    // - shadowBlurClipped: like shadowBlur, each shadow clipped to its bounds (shape + 3 sigma);
+    // - analytic: each shadow drawn without blurring, as 9 fills: the inside of the shape, the
+    //   edges with linear gradients and the corners with radial gradients that follow the profile
+    //   of a Gaussian blur of the edge (like Skia's analytic shadows of rounded rectangles);
+    // - analyticCanonical: like analytic, the edges filled with one gradient made once (placed
+    //   with the transformation), the corners with gradients whose stops are computed once, and
+    //   the alpha of the shadow applied with globalAlpha;
+    // - webgl: all the shadows of a frame drawn first by WebGL, in one instanced draw, into separate
+    //   parts of a WebGL canvas, with a shader computing the Gaussian blur of a rounded rectangle
+    //   (the integral across it with erf, sampled along it); each shadow is then drawn from its part
+    //   of that canvas;
+    // - renderer: as the renderer paints shadows now (ShadowPainter): the edges filled with one
+    //   gradient made once, the corners with one radial gradient per shadow placed at each corner
+    //   with the transformation, the regions cut at whole pixels;
+    // - rendererMerged: like renderer, the inside filled by the top and bottom edges, whose gradient
+    //   extends inside with its first (opaque) stop: 8 fills instead of 9;
+    // - rendererCachedCorner: like renderer, its radial gradient made once (wrong when animated:
+    //   only tells what making it costs);
+    // - rendererSolid: like renderer, filled with a color instead of gradients (wrong picture: only
+    //   tells what the gradients cost);
+    // - rendererImages: like renderer, each region drawn from a part of one image made once (wrong
+    //   picture: only tells what drawing the regions as images of one source costs);
+    // - rendererCross: like renderer in 6 fills: the column between the corners (the top edge, the
+    //   inside and the bottom edge) with one linear gradient of the shadow, the left and right edges
+    //   with one more (a path of both), and the 4 corners.
+    //
+    // `?animate=1` changes the blur of every shadow in every frame, like an elevation animation.
+    // `?stops=` sets the number of stops of the profile of the renderer variants (9 by default).
+    const params = new URLSearchParams(location.search);
+    const variant = params.get('variant') ?? 'none';
+    const animate = params.get('animate') === '1';
+    const bench = window.__bench = { frames: 0, firstFrame: null, frameWork: null };
+
+    const main = document.getElementById('main');
+    main.width = Math.round(innerWidth * devicePixelRatio);
+    main.height = Math.round(innerHeight * devicePixelRatio);
+    const ctx = main.getContext('2d');
+
+    const Width = 260, Height = 180, Radius = 32;
+    const shadows = [
+        { sigma: 3, dy: 0, color: 'rgba(0,0,0,0.04)' }, // ambient
+        { sigma: 6, dy: 8, color: 'rgba(0,0,0,0.19)' }, // spot
+    ];
+    const cards = [];
+    for (let row = 0; row < 5; row++) {
+        for (let column = 0; column < 8; column++) cards.push({ x: 40 + column * 310, y: 40 + row * 240 });
+    }
+
+    function blurredShape(width, height, sigma, color) {
+        const margin = Math.ceil(3 * sigma);
+        const canvas = new OffscreenCanvas(width + 2 * margin, height + 2 * margin);
+        const c = canvas.getContext('2d');
+        c.filter = `blur(${sigma}px)`;
+        c.fillStyle = color;
+        c.beginPath();
+        c.roundRect(margin, margin, width, height, Radius);
+        c.fill();
+        return { canvas, margin };
+    }
+
+    // sprite: the blurred card, once per shadow.
+    const sprites = variant === 'sprite' ? shadows.map((s) => blurredShape(Width, Height, s.sigma, s.color)) : [];
+    // nineSlice: a blurred square of twice the corner (plus the blur), sliced at its middle.
+    const slices = variant === 'nineSlice'
+        ? shadows.map((s) => {
+            const side = 2 * (Radius + Math.ceil(3 * s.sigma)) + 2;
+            return blurredShape(side - 2 * Math.ceil(3 * s.sigma), side - 2 * Math.ceil(3 * s.sigma), s.sigma, s.color);
+        })
+        : [];
+
+    function drawNineSlice(slice, x, y, width, height) {
+        const { canvas, margin } = slice;
+        const corner = Radius + margin; // the part of the image that holds a corner
+        const W = canvas.width, H = canvas.height;
+        const left = x - margin, top = y - margin, right = x + width + margin, bottom = y + height + margin;
+        const innerW = right - left - 2 * corner, innerH = bottom - top - 2 * corner;
+        const midW = W - 2 * corner, midH = H - 2 * corner;
+        // corners
+        ctx.drawImage(canvas, 0, 0, corner, corner, left, top, corner, corner);
+        ctx.drawImage(canvas, W - corner, 0, corner, corner, right - corner, top, corner, corner);
+        ctx.drawImage(canvas, 0, H - corner, corner, corner, left, bottom - corner, corner, corner);
+        ctx.drawImage(canvas, W - corner, H - corner, corner, corner, right - corner, bottom - corner, corner, corner);
+        // edges
+        ctx.drawImage(canvas, corner, 0, midW, corner, left + corner, top, innerW, corner);
+        ctx.drawImage(canvas, corner, H - corner, midW, corner, left + corner, bottom - corner, innerW, corner);
+        ctx.drawImage(canvas, 0, corner, corner, midH, left, top + corner, corner, innerH);
+        ctx.drawImage(canvas, W - corner, corner, corner, midH, right - corner, top + corner, corner, innerH);
+        // center
+        ctx.drawImage(canvas, corner, corner, midW, midH, left + corner, top + corner, innerW, innerH);
+    }
+
+    // 1 - erf(x), Abramowitz and Stegun 7.1.26.
+    function erfc(x) {
+        const z = Math.abs(x);
+        const t = 1 / (1 + 0.3275911 * z);
+        const y = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))))
+            * Math.exp(-z * z);
+        return x >= 0 ? y : 2 - y;
+    }
+
+    // The alpha of a blurred straight edge at the signed distance d outside of it.
+    const coverage = (d, sigma) => 0.5 * erfc(d / (sigma * Math.SQRT2));
+    const Stops = 9;
+    const rgbaOf = (color, alpha) => `rgba(${color[0]},${color[1]},${color[2]},${alpha})`;
+
+    // A gradient from inside (t = 0, distance -extent) to outside (t = 1, distance +extent).
+    function addProfile(gradient, color, sigma, extent, from, to) {
+        for (let k = 0; k < Stops; k++) {
+            const t = k / (Stops - 1);
+            const d = -extent + 2 * extent * t;
+            gradient.addColorStop(from + (to - from) * t, rgbaOf(color, color[3] * coverage(d, sigma)));
+        }
+    }
+
+    function drawAnalyticShadow(x, y, w, h, r, sigma, color) {
+        const e = Math.ceil(3 * sigma);
+        const c = r + e; // the size of a corner box
+        const left = x - e, top = y - e, right = x + w + e, bottom = y + h + e;
+        // Corners: radial gradients around the centers of the corner arcs.
+        for (const [cx, cy, bx, by] of [
+            [x + r, y + r, left, top], [x + w - r, y + r, x + w - r, top],
+            [x + r, y + h - r, left, y + h - r], [x + w - r, y + h - r, x + w - r, y + h - r],
+        ]) {
+            const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, c);
+            const inner = Math.max(0, r - e) / c;
+            g.addColorStop(0, rgbaOf(color, color[3] * coverage(-r, sigma)));
+            addProfile(g, color, sigma, e, inner, 1);
+            ctx.fillStyle = g;
+            ctx.fillRect(bx, by, c, c);
+        }
+        // Edges: linear gradients across them.
+        const edge = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+            const g = ctx.createLinearGradient(x0, y0, x1, y1);
+            addProfile(g, color, sigma, e, 0, 1);
+            ctx.fillStyle = g;
+            ctx.fillRect(rx, ry, rw, rh);
+        };
+        edge(0, y + e, 0, top, x + r, top, w - 2 * r, c);
+        edge(0, y + h - e, 0, bottom, x + r, y + h - r, w - 2 * r, c);
+        edge(x + e, 0, left, 0, left, y + r, c, h - 2 * r);
+        edge(x + w - e, 0, right, 0, x + w - r, y + r, c, h - 2 * r);
+        // The inside.
+        ctx.fillStyle = rgbaOf(color, color[3]);
+        ctx.fillRect(x + r, y + r, w - 2 * r, h - 2 * r);
+    }
+    const shadowColors = [[0, 0, 0, 0.04], [0, 0, 0, 0.19]];
+
+    // The profile from inside (offset 0) to outside (offset 1) over -3..3 sigma, in opaque black: the
+    // same for every blur, since the extent is 3 sigma.
+    const profile = Array.from({ length: Stops }, (_, k) => {
+        const t = k / (Stops - 1);
+        return [t, `rgba(0,0,0,${coverage(-3 + 6 * t, 1)})`];
+    });
+    const edgeGradient = ctx.createLinearGradient(0, 0, 1, 0);
+    for (const [t, css] of profile) edgeGradient.addColorStop(t, css);
+
+    function drawCanonicalShadow(x, y, w, h, r, sigma, alpha) {
+        const e = 3 * sigma;
+        const c = r + e;
+        ctx.globalAlpha = alpha;
+        // Corners: the profile between radius r - e and r + e around the centers of the arcs.
+        for (const [cx, cy, bx, by] of [
+            [x + r, y + r, x - e, y - e], [x + w - r, y + r, x + w - r, y - e],
+            [x + r, y + h - r, x - e, y + h - r], [x + w - r, y + h - r, x + w - r, y + h - r],
+        ]) {
+            const g = ctx.createRadialGradient(cx, cy, Math.max(0, r - e), cx, cy, c);
+            for (const [t, css] of profile) g.addColorStop(t, css);
+            ctx.fillStyle = g;
+            ctx.fillRect(bx, by, c, c);
+        }
+        // Edges: the canonical gradient, its 0..1 mapped from inside (distance -e) to outside (+e).
+        ctx.fillStyle = edgeGradient;
+        const band = (a, b, cc, d, ex, f, rx, ry, rw, rh) => {
+            ctx.setTransform(a, b, cc, d, ex, f);
+            // The rectangle in the space of the gradient: the inverse of the transformation.
+            const det = a * d - b * cc;
+            const ix = (d * (rx - ex) - cc * (ry - f)) / det, iy = (-b * (rx - ex) + a * (ry - f)) / det;
+            const jx = (d * (rx + rw - ex) - cc * (ry + rh - f)) / det, jy = (-b * (rx + rw - ex) + a * (ry + rh - f)) / det;
+            ctx.fillRect(Math.min(ix, jx), Math.min(iy, jy), Math.abs(jx - ix), Math.abs(jy - iy));
+        };
+        // Top: inside at y + e, outside at y - e: gradient x axis along -y.
+        band(0, -2 * e, 1, 0, 0, y + e, x + r, y - e, w - 2 * r, c);
+        band(0, 2 * e, 1, 0, 0, y + h - e, x + r, y + h - r, w - 2 * r, c);
+        band(-2 * e, 0, 0, 1, x + e, 0, x - e, y + r, c, h - 2 * r);
+        band(2 * e, 0, 0, 1, x + w - e, 0, x + w - r, y + r, c, h - 2 * r);
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.fillStyle = 'black';
+        ctx.fillRect(x + r, y + r, w - 2 * r, h - 2 * r);
+        ctx.globalAlpha = 1;
+    }
+
+    // The renderer's shadows: the profile over -3..3 sigma in `stops` stops, as ShadowGradients.
+    const rendererStops = Number(params.get('stops') ?? 9);
+    const rendererProfile = Array.from({ length: rendererStops }, (_, k) => {
+        const t = k / (rendererStops - 1);
+        return [t, `rgba(0,0,0,${Math.round(255 * coverage(-3 + 6 * t, 1)) / 255})`];
+    });
+    const rendererEdge = ctx.createLinearGradient(0, 0, 1, 0);
+    for (const [t, css] of rendererProfile) rendererEdge.addColorStop(t, css);
+    const radialGradient = (inner, outer) => {
+        const g = ctx.createRadialGradient(0, 0, inner, 0, 0, outer);
+        for (const [t, css] of rendererProfile) g.addColorStop(t, css);
+        return g;
+    };
+    const cachedCorner = radialGradient(Radius - 3 * shadows[1].sigma, Radius + 3 * shadows[1].sigma);
+
+    // Fills the device rectangle (l, t, r, b) with the fill style placed by (a, b, c, d, e, f).
+    function fillRegion(a, b, c, d, e, f, l, t, r, bottom) {
+        if (r <= l || bottom <= t) return;
+        ctx.setTransform(a, b, c, d, e, f);
+        const det = a * d - b * c;
+        const mapX = (x, y) => (d * (x - e) - c * (y - f)) / det;
+        const mapY = (x, y) => (-b * (x - e) + a * (y - f)) / det;
+        const x0 = mapX(l, t), y0 = mapY(l, t), x1 = mapX(r, bottom), y1 = mapY(r, bottom);
+        ctx.fillRect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
+    }
+
+    // rendererImages: one image, whose parts stand for the gradients.
+    const pieces = variant === 'rendererImages' ? new OffscreenCanvas(256, 256) : null;
+    if (pieces) {
+        const c = pieces.getContext('2d');
+        c.fillStyle = radialGradient(32, 256);
+        c.fillRect(0, 0, 256, 256);
+    }
+
+    // Draws the device rectangle (l, t, r, b) from a part of `pieces`.
+    function drawPiece(l, t, r, b) {
+        if (r <= l || b <= t) return;
+        ctx.drawImage(pieces, 8, 8, 64, 64, l, t, r - l, b - t);
+    }
+
+    function drawImagesShadow(x, y, w, h, r, sigma, alpha) {
+        const spread = 3 * sigma;
+        const inset = Math.max(Math.min(r, Math.min(w, h) / 2), spread);
+        const left = x, top = y, right = x + w, bottom = y + h;
+        const x0 = Math.floor(left - spread), x1 = Math.round(left + inset);
+        const x2 = Math.max(x1, Math.round(right - inset)), x3 = Math.ceil(right + spread);
+        const y0 = Math.floor(top - spread), y1 = Math.round(top + inset);
+        const y2 = Math.max(y1, Math.round(bottom - inset)), y3 = Math.ceil(bottom + spread);
+        ctx.globalAlpha = alpha;
+        for (const [l, t, rr, b] of [
+            [x1, y1, x2, y2], [x1, y0, x2, y1], [x1, y2, x2, y3], [x0, y1, x1, y2], [x2, y1, x3, y2],
+            [x0, y0, x1, y1], [x2, y0, x3, y1], [x0, y2, x1, y3], [x2, y2, x3, y3],
+        ]) {
+            drawPiece(l, t, rr, b);
+        }
+        ctx.globalAlpha = 1;
+    }
+
+    // A gradient from `from` to `to` (device coordinates along one axis) that rises with the profile
+    // over 2 * spread from `from`, stays opaque, and falls with it over 2 * spread to `to`.
+    function acrossGradient(horizontal, from, to, spread) {
+        const g = horizontal ? ctx.createLinearGradient(from, 0, to, 0) : ctx.createLinearGradient(0, from, 0, to);
+        const ramp = Math.min(0.5, 2 * spread / (to - from));
+        for (const [t, css] of rendererProfile) g.addColorStop((1 - t) * ramp, css);
+        for (const [t, css] of rendererProfile) g.addColorStop(1 - (1 - t) * ramp, css);
+        return g;
+    }
+
+    function drawCrossShadow(x, y, w, h, r, sigma, alpha) {
+        const spread = 3 * sigma;
+        const inset = Math.max(Math.min(r, Math.min(w, h) / 2), spread);
+        const left = x, top = y, right = x + w, bottom = y + h;
+        const x0 = Math.floor(left - spread), x1 = Math.round(left + inset);
+        const x2 = Math.max(x1, Math.round(right - inset)), x3 = Math.ceil(right + spread);
+        const y0 = Math.floor(top - spread), y1 = Math.round(top + inset);
+        const y2 = Math.max(y1, Math.round(bottom - inset)), y3 = Math.ceil(bottom + spread);
+        ctx.globalAlpha = alpha;
+        // The column between the corners.
+        ctx.fillStyle = acrossGradient(false, top - spread, bottom + spread, spread);
+        ctx.fillRect(x1, y0, x2 - x1, y3 - y0);
+        // The left and right edges.
+        ctx.fillStyle = acrossGradient(true, left - spread, right + spread, spread);
+        ctx.beginPath();
+        ctx.rect(x0, y1, x1 - x0, y2 - y1);
+        ctx.rect(x2, y1, x3 - x2, y2 - y1);
+        ctx.fill();
+        ctx.fillStyle = radialGradient(inset - spread, inset + spread);
+        fillRegion(1, 0, 0, 1, left + inset, top + inset, x0, y0, x1, y1);
+        fillRegion(1, 0, 0, 1, right - inset, top + inset, x2, y0, x3, y1);
+        fillRegion(1, 0, 0, 1, left + inset, bottom - inset, x0, y2, x1, y3);
+        fillRegion(1, 0, 0, 1, right - inset, bottom - inset, x2, y2, x3, y3);
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.globalAlpha = 1;
+    }
+
+    function drawRendererShadow(x, y, w, h, r, sigma, alpha, { merged = false, cached = false, solid = false } = {}) {
+        const spread = 3 * sigma;
+        const inset = Math.max(Math.min(r, Math.min(w, h) / 2), spread);
+        const left = x, top = y, right = x + w, bottom = y + h;
+        const x0 = Math.floor(left - spread), x1 = Math.round(left + inset);
+        const x2 = Math.max(x1, Math.round(right - inset)), x3 = Math.ceil(right + spread);
+        const y0 = Math.floor(top - spread), y1 = Math.round(top + inset);
+        const y2 = Math.max(y1, Math.round(bottom - inset)), y3 = Math.ceil(bottom + spread);
+        const across = 2 * spread;
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = 'black';
+        // The top and bottom edges, which fill the inside too when merged.
+        const middle = merged ? Math.round((y1 + y2) / 2) : null;
+        if (!merged) fillRegion(1, 0, 0, 1, 0, 0, x1, y1, x2, y2);
+        if (!solid) ctx.fillStyle = rendererEdge;
+        fillRegion(0, -across, 1, 0, 0, top + spread, x1, y0, x2, merged ? middle : y1);
+        fillRegion(0, across, 1, 0, 0, bottom - spread, x1, merged ? middle : y2, x2, y3);
+        fillRegion(-across, 0, 0, 1, left + spread, 0, x0, y1, x1, y2);
+        fillRegion(across, 0, 0, 1, right - spread, 0, x2, y1, x3, y2);
+        if (!solid) ctx.fillStyle = cached ? cachedCorner : radialGradient(inset - spread, inset + spread);
+        fillRegion(1, 0, 0, 1, left + inset, top + inset, x0, y0, x1, y1);
+        fillRegion(1, 0, 0, 1, right - inset, top + inset, x2, y0, x3, y1);
+        fillRegion(1, 0, 0, 1, left + inset, bottom - inset, x0, y2, x1, y3);
+        fillRegion(1, 0, 0, 1, right - inset, bottom - inset, x2, y2, x3, y3);
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.globalAlpha = 1;
+    }
+
+    // WebGL shadows.
+    const glCanvas = variant === 'webgl' ? document.createElement('canvas') : null;
+    let gl = null, glProgram = null, instanceBuffer = null, instanceData = null;
+    const GlWidth = 2560, GlHeight = 2400;
+    if (glCanvas) {
+        glCanvas.width = GlWidth;
+        glCanvas.height = GlHeight;
+        gl = glCanvas.getContext('webgl2', { premultipliedAlpha: true, preserveDrawingBuffer: true });
+        const compile = (type, source) => {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(shader));
+            return shader;
+        };
+        glProgram = gl.createProgram();
+        // Per instance: the area in the WebGL canvas (x, y, w, h), the shape relative to it
+        // (left, top, right, bottom), and (radius, sigma, alpha).
+        gl.attachShader(glProgram, compile(gl.VERTEX_SHADER, `#version 300 es
+in vec2 aCorner;
+in vec4 aArea;
+in vec4 aShape;
+in vec3 aParams;
+uniform vec2 uCanvas;
+out vec2 vPoint;
+flat out vec4 vShape;
+flat out vec3 vParams;
+void main() {
+    vec2 p = aArea.xy + aCorner * aArea.zw;
+    vPoint = aCorner * aArea.zw;
+    vShape = aShape;
+    vParams = aParams;
+    gl_Position = vec4(p.x / uCanvas.x * 2.0 - 1.0, 1.0 - p.y / uCanvas.y * 2.0, 0.0, 1.0);
+}`));
+        gl.attachShader(glProgram, compile(gl.FRAGMENT_SHADER, `#version 300 es
+precision highp float;
+in vec2 vPoint;
+flat in vec4 vShape;
+flat in vec3 vParams;
+out vec4 outColor;
+vec2 erf(vec2 x) {
+    vec2 s = sign(x), a = abs(x);
+    x = 1.0 + (0.278393 + (0.230389 + 0.078108 * (a * a)) * a) * a;
+    x *= x;
+    return s - s / (x * x);
+}
+float gaussian(float x, float sigma) {
+    return exp(-(x * x) / (2.0 * sigma * sigma)) / (2.5066283 * sigma);
+}
+// The blur across x of the row of the rounded box at height y.
+float row(float x, float y, float sigma, float corner, vec2 half) {
+    float delta = min(half.y - corner - abs(y), 0.0);
+    float curved = half.x - corner + sqrt(max(0.0, corner * corner - delta * delta));
+    vec2 integral = 0.5 + 0.5 * erf((x + vec2(-curved, curved)) * (0.70710678 / sigma));
+    return integral.y - integral.x;
+}
+void main() {
+    float corner = vParams.x, sigma = vParams.y;
+    vec2 center = (vShape.xy + vShape.zw) * 0.5;
+    vec2 half = (vShape.zw - vShape.xy) * 0.5;
+    vec2 p = vPoint - center;
+    float low = p.y - half.y, high = p.y + half.y;
+    float start = clamp(-3.0 * sigma, low, high), end = clamp(3.0 * sigma, low, high);
+    float step = (end - start) / 4.0;
+    float y = start + step * 0.5;
+    float value = 0.0;
+    for (int i = 0; i < 4; i++) {
+        value += row(p.x, p.y - y, sigma, corner, half) * gaussian(y, sigma) * step;
+        y += step;
+    }
+    outColor = vec4(0.0, 0.0, 0.0, value * vParams.z);
+}`));
+        gl.linkProgram(glProgram);
+        gl.useProgram(glProgram);
+        const vao = gl.createVertexArray();
+        gl.bindVertexArray(vao);
+        gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]), gl.STATIC_DRAW);
+        const cornerLocation = gl.getAttribLocation(glProgram, 'aCorner');
+        gl.enableVertexAttribArray(cornerLocation);
+        gl.vertexAttribPointer(cornerLocation, 2, gl.FLOAT, false, 0, 0);
+        instanceBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, instanceBuffer);
+        const stride = 11 * 4;
+        [['aArea', 4, 0], ['aShape', 4, 16], ['aParams', 3, 32]].forEach(([name, size, offset]) => {
+            const location = gl.getAttribLocation(glProgram, name);
+            gl.enableVertexAttribArray(location);
+            gl.vertexAttribPointer(location, size, gl.FLOAT, false, stride, offset);
+            gl.vertexAttribDivisor(location, 1);
+        });
+        gl.uniform2f(gl.getUniformLocation(glProgram, 'uCanvas'), GlWidth, GlHeight);
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+        instanceData = new Float32Array(cards.length * shadows.length * 11);
+    }
+
+    // Draws all the shadows into the WebGL canvas, and returns where each is.
+    function drawWebGlShadows(time) {
+        const placed = [];
+        let x = 0, y = 0, rowHeight = 0, n = 0;
+        for (const [index, card] of cards.entries()) {
+            const scale = animate ? 0.5 + Math.abs(Math.sin(time * 2 + index * 0.3)) : 1;
+            shadows.forEach((base, i) => {
+                const sigma = base.sigma * scale;
+                const dy = base.dy * scale;
+                const margin = Math.ceil(3 * sigma) + 1;
+                const w = Width + 2 * margin, h = Height + 2 * margin;
+                if (x + w > GlWidth) { x = 0; y += rowHeight + 1; rowHeight = 0; }
+                const o = n * 11;
+                instanceData[o] = x; instanceData[o + 1] = y; instanceData[o + 2] = w; instanceData[o + 3] = h;
+                instanceData[o + 4] = margin; instanceData[o + 5] = margin;
+                instanceData[o + 6] = margin + Width; instanceData[o + 7] = margin + Height;
+                instanceData[o + 8] = Radius; instanceData[o + 9] = sigma; instanceData[o + 10] = shadowColors[i][3];
+                placed.push({ sx: x, sy: y, w, h, dx: card.x - margin, dy: card.y + dy - margin });
+                x += w + 1;
+                rowHeight = Math.max(rowHeight, h);
+                n++;
+            });
+        }
+        gl.viewport(0, 0, GlWidth, GlHeight);
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.bindBuffer(gl.ARRAY_BUFFER, instanceBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, instanceData, gl.STREAM_DRAW);
+        gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, n);
+        return placed;
+    }
+
+    function drawFrame(time) {
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, main.width, main.height);
+        const placed = variant === 'webgl' ? drawWebGlShadows(time) : null;
+        for (const [index, card] of cards.entries()) {
+            if (placed) {
+                for (let i = 0; i < shadows.length; i++) {
+                    const s = placed[index * shadows.length + i];
+                    ctx.drawImage(glCanvas, s.sx, s.sy, s.w, s.h, s.dx, s.dy, s.w, s.h);
+                }
+            }
+            const scale = animate ? 0.5 + Math.abs(Math.sin(time * 2 + index * 0.3)) : 1;
+            shadows.forEach((base, i) => {
+                const s = { ...base, sigma: base.sigma * scale, dy: base.dy * scale };
+                switch (variant) {
+                    case 'analytic':
+                        drawAnalyticShadow(card.x, card.y + s.dy, Width, Height, Radius, s.sigma, shadowColors[i]);
+                        break;
+                    case 'analyticCanonical':
+                        drawCanonicalShadow(card.x, card.y + s.dy, Width, Height, Radius, s.sigma, shadowColors[i][3]);
+                        break;
+                    case 'renderer':
+                    case 'rendererMerged':
+                    case 'rendererCachedCorner':
+                    case 'rendererSolid':
+                        drawRendererShadow(card.x, card.y + s.dy, Width, Height, Radius, s.sigma, shadowColors[i][3], {
+                            merged: variant === 'rendererMerged',
+                            cached: variant === 'rendererCachedCorner',
+                            solid: variant === 'rendererSolid',
+                        });
+                        break;
+                    case 'rendererImages':
+                        drawImagesShadow(card.x, card.y + s.dy, Width, Height, Radius, s.sigma, shadowColors[i][3]);
+                        break;
+                    case 'rendererCross':
+                        drawCrossShadow(card.x, card.y + s.dy, Width, Height, Radius, s.sigma, shadowColors[i][3]);
+                        break;
+                    case 'shadowBlurClipped': {
+                        const m = 3 * s.sigma + 1;
+                        ctx.save();
+                        ctx.beginPath();
+                        ctx.rect(card.x - m, card.y + s.dy - m, Width + 2 * m, Height + 2 * m);
+                        ctx.clip();
+                        ctx.shadowColor = s.color;
+                        ctx.shadowBlur = 2 * s.sigma;
+                        ctx.shadowOffsetX = 100000;
+                        ctx.shadowOffsetY = s.dy;
+                        ctx.fillStyle = 'black';
+                        ctx.beginPath();
+                        ctx.roundRect(card.x - 100000, card.y, Width, Height, Radius);
+                        ctx.fill();
+                        ctx.restore();
+                        break;
+                    }
+                    case 'shadowBlur':
+                        ctx.save();
+                        ctx.shadowColor = s.color;
+                        ctx.shadowBlur = 2 * s.sigma;
+                        ctx.shadowOffsetX = 100000;
+                        ctx.shadowOffsetY = s.dy;
+                        ctx.fillStyle = 'black';
+                        ctx.beginPath();
+                        ctx.roundRect(card.x - 100000, card.y, Width, Height, Radius);
+                        ctx.fill();
+                        ctx.restore();
+                        break;
+                    case 'sprite': {
+                        const sprite = sprites[i];
+                        ctx.drawImage(sprite.canvas, card.x - sprite.margin, card.y - sprite.margin + s.dy);
+                        break;
+                    }
+                    case 'nineSlice':
+                        drawNineSlice(slices[i], card.x, card.y + s.dy, Width, Height);
+                        break;
+                }
+            });
+            ctx.fillStyle = '#6750A4';
+            ctx.beginPath();
+            ctx.roundRect(card.x, card.y, Width, Height, Radius);
+            ctx.fill();
+        }
+        // Something moves, so that every frame is drawn.
+        ctx.fillStyle = '#E53935';
+        ctx.fillRect(1000 + Math.sin(time) * 800, 1300, 40, 40);
+    }
+
+    let start = null;
+    function frame(timestamp) {
+        if (start === null) start = timestamp;
+        const workStart = performance.now();
+        drawFrame((timestamp - start) / 1000);
+        if (bench.frameWork) bench.frameWork.push(performance.now() - workStart);
+        bench.frames++;
+        if (bench.firstFrame === null) bench.firstFrame = performance.now();
+        requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+</script>
+</body>
+</html>

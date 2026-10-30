@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Offscreen layers in Canvas 2D</title>
+    <style>
+        html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; }
+        canvas { display: block; width: 100%; height: 100%; }
+    </style>
+</head>
+<body>
+<canvas id="main"></canvas>
+<script>
+    // What it costs to draw a layer through an offscreen canvas in Canvas 2D, the way a renderer of
+    // Compose's graphics layers would. 400 layers of 80x80 device pixels, each a rounded rectangle,
+    // rotated and faded in every frame. `?variant=` picks how a layer reaches the screen:
+    //
+    // - direct: drawn straight onto the screen with globalAlpha (no offscreen canvas);
+    // - reuse: drawn into one offscreen canvas, cleared and reused for every layer, then composited;
+    // - perLayer: drawn into an offscreen canvas of its own (kept across frames), then composited;
+    // - cached: like perLayer, but the content is drawn once: every frame only composites it;
+    // - fresh: drawn into a new offscreen canvas every time, then composited;
+    // - atlas: all layers drawn into one large canvas first, then composited from it;
+    // - atlasInterleaved: each layer drawn into its own slot of one large canvas and composited
+    //   from it right away, before the next layer is drawn;
+    // - perLayerBatched: like perLayer, but all layers are drawn before any is composited;
+    // - transfer: drawn into one OffscreenCanvas, turned into an ImageBitmap with
+    //   transferToImageBitmap() and composited right away;
+    // - transferBatched: like transfer, but all layers are turned into ImageBitmaps first;
+    // - atlasNested: the layers in 40 groups of 10: all drawn into one large canvas, composited
+    //   into the slots of their groups in a second large canvas, which are composited onto the
+    //   screen (two levels of nesting, one flush per level);
+    // - atlasFilter: like atlas, composited through an SVG color matrix filter (ctx.filter url());
+    // - atlasBlur: like atlas, composited through ctx.filter = 'blur(2px)';
+    // - atlasSaturate: like atlas, composited through ctx.filter = 'saturate(0.2)';
+    // - atlasBlurClipped, atlasFilterClipped: like atlasBlur and atlasFilter, each composite
+    //   clipped to the rectangle of its layer.
+    //
+    // `?element=1` uses detached <canvas> elements instead of OffscreenCanvas; `?canvasSize=` sets
+    // the size of the offscreen canvases of reuse, perLayer, cached and fresh (default: 128 for
+    // reuse, the layer size for the others).
+    const params = new URLSearchParams(location.search);
+    const variant = params.get('variant') ?? 'direct';
+    const useElements = params.get('element') === '1';
+    const canvasSize = params.has('canvasSize') ? Number(params.get('canvasSize')) : null;
+
+    const bench = window.__bench = { frames: 0, firstFrame: null, frameWork: null };
+
+    const main = document.getElementById('main');
+    const dpr = window.devicePixelRatio;
+    main.width = Math.round(innerWidth * dpr);
+    main.height = Math.round(innerHeight * dpr);
+    const ctx = main.getContext('2d');
+
+    const Count = 400;
+    const Columns = 25;
+    const Size = 80; // device pixels, a 40dp box at 2x
+    const Pitch = 96;
+    const colors = ['#6750A4', '#00897B', '#E53935', '#FB8C00', '#3949AB', '#43A047', '#8E24AA', '#00ACC1'];
+
+    function newCanvas(width, height) {
+        if (useElements) {
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            return canvas;
+        }
+        return new OffscreenCanvas(width, height);
+    }
+
+    function drawContent(target, index, x, y) {
+        target.fillStyle = colors[index % colors.length];
+        target.beginPath();
+        target.roundRect(x, y, Size, Size, 20);
+        target.fill();
+    }
+
+    function placeLayer(index, time) {
+        const column = index % Columns;
+        const row = Math.floor(index / Columns);
+        const cx = 16 + column * Pitch + Size / 2;
+        const cy = 16 + row * Pitch + Size / 2;
+        const angle = (time * 90 + index * 7) * Math.PI / 180;
+        const scale = 0.75 + 0.25 * Math.sin(time * 3 + index);
+        ctx.setTransform(
+            scale * Math.cos(angle), scale * Math.sin(angle),
+            -scale * Math.sin(angle), scale * Math.cos(angle),
+            cx, cy,
+        );
+        ctx.globalAlpha = 0.4 + 0.6 * Math.abs(Math.sin(time * 2 + index * 0.3));
+    }
+
+    const reused = variant.startsWith('transfer')
+        ? new OffscreenCanvas(canvasSize ?? Size, canvasSize ?? Size)
+        : newCanvas(canvasSize ?? 128, canvasSize ?? 128);
+    const reusedCtx = reused.getContext('2d');
+    const layerCanvasSize = canvasSize ?? Size;
+    const perLayer = [];
+    if (variant === 'perLayer' || variant === 'perLayerBatched' || variant === 'cached') {
+        for (let i = 0; i < Count; i++) {
+            const canvas = newCanvas(layerCanvasSize, layerCanvasSize);
+            const layerCtx = canvas.getContext('2d');
+            if (variant === 'cached') drawContent(layerCtx, i, 0, 0);
+            perLayer.push({ canvas, ctx: layerCtx });
+        }
+    }
+    const bitmaps = new Array(Count);
+    const usesAtlas = variant.startsWith('atlas');
+    const atlas = usesAtlas ? newCanvas(Columns * Size, Math.ceil(Count / Columns) * Size) : null;
+    const atlasCtx = atlas?.getContext('2d');
+
+    // atlasNested: 40 groups of 5x2 children; a group slot is 400x160 in the second canvas.
+    const GroupColumns = 5;
+    const GroupSize = 10;
+    const groups = variant === 'atlasNested' ? newCanvas(4 * GroupColumns * Size, 10 * 2 * Size) : null;
+    const groupsCtx = groups?.getContext('2d');
+
+    if (variant === 'atlasFilter') {
+        document.body.insertAdjacentHTML('beforeend',
+            '<svg width="0" height="0" style="position:absolute"><filter id="m" color-interpolation-filters="sRGB">' +
+            '<feColorMatrix type="matrix" values="0.3 0.6 0.1 0 0  0.3 0.6 0.1 0 0  0.3 0.6 0.1 0 0  0 0 0 1 0"/>' +
+            '</filter></svg>');
+    }
+
+    function drawGroups(time) {
+        atlasCtx.clearRect(0, 0, atlas.width, atlas.height);
+        for (let i = 0; i < Count; i++) {
+            drawContent(atlasCtx, i, (i % Columns) * Size, Math.floor(i / Columns) * Size);
+        }
+        groupsCtx.clearRect(0, 0, groups.width, groups.height);
+        for (let i = 0; i < Count; i++) {
+            const group = Math.floor(i / GroupSize);
+            const k = i % GroupSize;
+            const gx = (group % 4) * GroupColumns * Size + (k % GroupColumns) * Size;
+            const gy = Math.floor(group / 4) * 2 * Size + Math.floor(k / GroupColumns) * Size;
+            groupsCtx.globalAlpha = 0.4 + 0.6 * Math.abs(Math.sin(time * 2 + i * 0.3));
+            groupsCtx.drawImage(atlas, (i % Columns) * Size, Math.floor(i / Columns) * Size, Size, Size, gx, gy, Size, Size);
+        }
+        groupsCtx.globalAlpha = 1;
+        const groupWidth = GroupColumns * Size;
+        const groupHeight = 2 * Size;
+        for (let group = 0; group < Count / GroupSize; group++) {
+            const angle = (time * 20 + group * 9) * Math.PI / 180;
+            const x = 40 + (group % 5) * 480;
+            const y = 40 + Math.floor(group / 5) * 190;
+            ctx.setTransform(Math.cos(angle), Math.sin(angle), -Math.sin(angle), Math.cos(angle), x + groupWidth / 2, y + groupHeight / 2);
+            ctx.drawImage(
+                groups,
+                (group % 4) * groupWidth, Math.floor(group / 4) * groupHeight, groupWidth, groupHeight,
+                -groupWidth / 2, -groupHeight / 2, groupWidth, groupHeight,
+            );
+        }
+    }
+
+    function drawFrame(time) {
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.globalAlpha = 1;
+        ctx.clearRect(0, 0, main.width, main.height);
+        if (variant === 'atlasNested') {
+            drawGroups(time);
+            return;
+        }
+        if (variant === 'atlasInterleaved') atlasCtx.clearRect(0, 0, atlas.width, atlas.height);
+        if (variant.startsWith('atlas') && variant !== 'atlasInterleaved') {
+            atlasCtx.clearRect(0, 0, atlas.width, atlas.height);
+            for (let i = 0; i < Count; i++) {
+                drawContent(atlasCtx, i, (i % Columns) * Size, Math.floor(i / Columns) * Size);
+            }
+        }
+        if (variant === 'perLayerBatched') {
+            for (let i = 0; i < Count; i++) {
+                const layer = perLayer[i];
+                layer.ctx.clearRect(0, 0, Size, Size);
+                drawContent(layer.ctx, i, 0, 0);
+            }
+        }
+        if (variant === 'transferBatched') {
+            for (let i = 0; i < Count; i++) {
+                drawContent(reusedCtx, i, 0, 0);
+                bitmaps[i] = reused.transferToImageBitmap();
+            }
+        }
+        if (variant === 'atlasFilter' || variant === 'atlasFilterClipped') ctx.filter = 'url(#m)';
+        if (variant === 'atlasBlur' || variant === 'atlasBlurClipped') ctx.filter = 'blur(2px)';
+        if (variant === 'atlasSaturate') ctx.filter = 'saturate(0.2)';
+        for (let i = 0; i < Count; i++) {
+            placeLayer(i, time);
+            switch (variant) {
+                case 'direct':
+                    drawContent(ctx, i, -Size / 2, -Size / 2);
+                    break;
+                case 'reuse':
+                    reusedCtx.clearRect(0, 0, reused.width, reused.height);
+                    drawContent(reusedCtx, i, 0, 0);
+                    ctx.drawImage(reused, 0, 0, Size, Size, -Size / 2, -Size / 2, Size, Size);
+                    break;
+                case 'perLayer': {
+                    const layer = perLayer[i];
+                    layer.ctx.clearRect(0, 0, Size, Size);
+                    drawContent(layer.ctx, i, 0, 0);
+                    ctx.drawImage(layer.canvas, -Size / 2, -Size / 2);
+                    break;
+                }
+                case 'cached':
+                    ctx.drawImage(perLayer[i].canvas, -Size / 2, -Size / 2);
+                    break;
+                case 'atlasInterleaved': {
+                    const x = (i % Columns) * Size;
+                    const y = Math.floor(i / Columns) * Size;
+                    drawContent(atlasCtx, i, x, y);
+                    ctx.drawImage(atlas, x, y, Size, Size, -Size / 2, -Size / 2, Size, Size);
+                    break;
+                }
+                case 'fresh': {
+                    const canvas = newCanvas(layerCanvasSize, layerCanvasSize);
+                    drawContent(canvas.getContext('2d'), i, 0, 0);
+                    ctx.drawImage(canvas, -Size / 2, -Size / 2);
+                    break;
+                }
+                case 'atlas':
+                case 'atlasFilter':
+                case 'atlasBlur':
+                case 'atlasSaturate':
+                    ctx.drawImage(
+                        atlas,
+                        (i % Columns) * Size, Math.floor(i / Columns) * Size, Size, Size,
+                        -Size / 2, -Size / 2, Size, Size,
+                    );
+                    break;
+                case 'atlasBlurClipped':
+                case 'atlasFilterClipped':
+                    ctx.save();
+                    ctx.beginPath();
+                    ctx.rect(-Size / 2 - 8, -Size / 2 - 8, Size + 16, Size + 16);
+                    ctx.clip();
+                    ctx.drawImage(
+                        atlas,
+                        (i % Columns) * Size, Math.floor(i / Columns) * Size, Size, Size,
+                        -Size / 2, -Size / 2, Size, Size,
+                    );
+                    ctx.restore();
+                    break;
+                case 'perLayerBatched':
+                    ctx.drawImage(perLayer[i].canvas, -Size / 2, -Size / 2);
+                    break;
+                case 'transfer': {
+                    drawContent(reusedCtx, i, 0, 0);
+                    const bitmap = reused.transferToImageBitmap();
+                    ctx.drawImage(bitmap, -Size / 2, -Size / 2);
+                    bitmap.close();
+                    break;
+                }
+                case 'transferBatched':
+                    ctx.drawImage(bitmaps[i], -Size / 2, -Size / 2);
+                    bitmaps[i].close();
+                    break;
+            }
+        }
+        ctx.filter = 'none';
+    }
+
+    let start = null;
+    function frame(timestamp) {
+        if (start === null) start = timestamp;
+        const workStart = performance.now();
+        drawFrame((timestamp - start) / 1000);
+        if (bench.frameWork) bench.frameWork.push(performance.now() - workStart);
+        bench.frames++;
+        if (bench.firstFrame === null) bench.firstFrame = performance.now();
+        requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+</script>
+</body>
+</html>

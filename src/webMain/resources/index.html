@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Compose Web benchmark</title>
+    <style>
+        html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; }
+    </style>
+    <script>
+        // The probes the runner reads, the same for both builds of Compose:
+        // - firstDraw: when Compose drew its first frame (performance.now(), ms);
+        // - firstFrame: the start of the next animation frame, when that frame has been submitted;
+        // - frames: the frames of an animated scenario;
+        // - frameWork: while it is an array, the time each animation frame spent in
+        //   requestAnimationFrame callbacks (the work of Compose and of its renderer on the main
+        //   thread), one entry per frame.
+        (function () {
+            const bench = window.__bench = {
+                frames: 0,
+                firstDraw: null,
+                firstFrame: null,
+                frameWork: null,
+                onFirstDraw() {
+                    if (bench.firstDraw !== null) return;
+                    bench.firstDraw = performance.now();
+                    requestAnimationFrame(() => { bench.firstFrame = performance.now(); });
+                },
+                onFrame() { bench.frames++; },
+            };
+            const requestFrame = window.requestAnimationFrame.bind(window);
+            let frameTimestamp = -1;
+            let frameWork = 0;
+            window.requestAnimationFrame = function (callback) {
+                return requestFrame(function (timestamp) {
+                    const start = performance.now();
+                    try {
+                        callback(timestamp);
+                    } finally {
+                        if (timestamp !== frameTimestamp) {
+                            if (frameTimestamp >= 0 && bench.frameWork) bench.frameWork.push(frameWork);
+                            frameTimestamp = timestamp;
+                            frameWork = 0;
+                        }
+                        frameWork += performance.now() - start;
+                    }
+                });
+            };
+        })();
+
+        // When runner/safari.mjs opens the page (a `run` parameter in the fragment, for browsers it
+        // can't drive through the DevTools protocol), the page measures itself as runner/run.mjs
+        // measures it and posts what it measured to /runs/<run>/<event> of the server:
+        // - `result` when the first frame has been submitted, or with `warmup` and `measure` (ms),
+        //   after warming up, `start`, measuring the frames, `stop`, waiting for each answer;
+        // - `error` for every uncaught error and lost WebGL context, `console` for the first messages
+        //   logged as errors or warnings;
+        // - `hidden` when the page is hidden, and so draws no frames (the measurement is spoiled), and
+        //   `shown` when it is shown again.
+        // The parameters are in the fragment so that the page has the URL of a visit without them.
+        (function () {
+            const parameters = new URLSearchParams(location.hash.slice(1));
+            const run = parameters.get('run');
+            if (run === null) return;
+            const bench = window.__bench;
+            const post = (event, data = {}) => fetch(`/runs/${run}/${event}`, { method: 'POST', body: JSON.stringify(data) });
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            window.addEventListener('error', (event) => post('error', { message: String(event.error ?? event.message) }));
+            window.addEventListener('unhandledrejection', (event) => post('error', { message: String(event.reason) }));
+            let consoleMessages = 0;
+            for (const level of ['error', 'warn']) {
+                const log = console[level].bind(console);
+                console[level] = (...args) => {
+                    if (consoleMessages++ < 20) post('console', { message: `${level}: ${args.map(String).join(' ')}` });
+                    log(...args);
+                };
+            }
+            const getContext = HTMLCanvasElement.prototype.getContext;
+            HTMLCanvasElement.prototype.getContext = function (type, ...options) {
+                const context = getContext.call(this, type, ...options);
+                if (context && type.startsWith('webgl')) {
+                    this.addEventListener('webglcontextlost', () => post('error', { message: 'WebGL context lost' }));
+                }
+                return context;
+            };
+            // Safari shows the page of a new window only with its first frame, so the page counts as
+            // hidden once it was shown, or a second after it started.
+            let counts = false;
+            let reportedHidden = false;
+            const reportVisibility = () => {
+                const hidden = document.visibilityState === 'hidden';
+                if (!counts || hidden === reportedHidden) return;
+                reportedHidden = hidden;
+                post(hidden ? 'hidden' : 'shown');
+            };
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'visible') counts = true;
+                reportVisibility();
+            });
+            setTimeout(() => {
+                counts = true;
+                reportVisibility();
+            }, 1000);
+
+            function gpu() {
+                const gl = document.createElement('canvas').getContext('webgl2');
+                if (!gl) return 'no WebGL 2';
+                const info = gl.getExtension('WEBGL_debug_renderer_info');
+                return gl.getParameter(info ? info.UNMASKED_RENDERER_WEBGL : gl.RENDERER);
+            }
+
+            async function measure() {
+                while (bench.firstFrame === null) await sleep(25);
+                const page = {
+                    firstDraw: bench.firstDraw,
+                    firstFrame: bench.firstFrame,
+                    userAgent: navigator.userAgent,
+                    viewport: { width: innerWidth, height: innerHeight, deviceScaleFactor: devicePixelRatio },
+                    windowChrome: { width: outerWidth - innerWidth, height: outerHeight - innerHeight },
+                    gpu: parameters.has('describe') ? gpu() : undefined,
+                };
+                const warmup = parameters.get('warmup');
+                if (warmup === null) {
+                    await post('result', page);
+                    return;
+                }
+                await sleep(Number(warmup));
+                await post('start');
+                bench.frameWork = [];
+                const before = { time: performance.now(), frames: bench.frames };
+                await sleep(Number(parameters.get('measure')));
+                const after = { time: performance.now(), frames: bench.frames };
+                const frameWork = bench.frameWork;
+                bench.frameWork = null;
+                await post('stop');
+                await post('result', {
+                    ...page,
+                    seconds: (after.time - before.time) / 1000,
+                    frames: after.frames - before.frames,
+                    frameWorkMs: frameWork,
+                });
+            }
+
+            measure();
+        })();
+    </script>
+</head>
+<body>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Layers in perspective in Canvas 2D</title>
+    <style>
+        html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; }
+        canvas { display: block; width: 100%; height: 100%; }
+    </style>
+</head>
+<body>
+<canvas id="main"></canvas>
+<script>
+    // What it costs to draw layers in perspective with Canvas 2D and WebGL 2, the way a renderer of
+    // Compose's graphics layers would: Canvas 2D can't draw in perspective, so the content of a
+    // layer is drawn into a canvas, WebGL draws that image in perspective, and the result is drawn
+    // into the screen. 24 cards of 392x120 device pixels with a text, turning around their vertical
+    // axis in every frame. `?variant=`:
+    //
+    // - flat: the cards drawn straight onto the screen, without perspective;
+    // - perLayer: for every card, its content drawn into a canvas (reused), uploaded to a texture,
+    //   drawn in perspective by WebGL, and the result drawn into the screen right away (as the
+    //   renderer does now);
+    // - batched: the content of all the cards drawn into one canvas first, each card uploaded to a
+    //   texture of its own from its part of that canvas, all drawn in perspective into separate
+    //   parts of the WebGL canvas, and then drawn into the screen;
+    // - batchedAtlasTexture: like batched, with the whole canvas uploaded to one texture once,
+    //   each card sampling its part of it;
+    // - batchedAtlasNoMip: like batchedAtlasTexture, without mipmaps (linear filtering only);
+    // - batchedAtlasSub: like batchedAtlasTexture, uploading into a texture whose storage is
+    //   allocated once (texStorage2D + texSubImage2D) instead of anew every frame (texImage2D);
+    // - batchedAtlasSubNoMip: batchedAtlasSub without mipmaps;
+    // - batchedAtlasNoPreserve: like batchedAtlasTexture, with a WebGL context that doesn't preserve
+    //   its drawing buffer;
+    // - batchedAtlasTransfer: like batchedAtlasTexture, with WebGL drawing into an OffscreenCanvas
+    //   whose frame is handed over with transferToImageBitmap();
+    // - strips: no WebGL: the content of all the cards drawn into one canvas first, each card then
+    //   drawn into the screen as vertical strips of whole device columns, each strip an image drawn
+    //   with an affine transformation. Turning around the vertical axis maps every column of the
+    //   card to a vertical segment, affinely, and its top and bottom edges to straight lines, so a
+    //   strip is exact but for the height of its right end, off by at most `?error=` pixels (0.25
+    //   by default), which sets the width of the strips.
+    //
+    // `?time=` draws the frame of that time (seconds) in every frame, to compare the pictures.
+    const params = new URLSearchParams(location.search);
+    const variant = params.get('variant') ?? 'flat';
+    const frozenTime = params.has('time') ? Number(params.get('time')) : null;
+    const maxError = Number(params.get('error') ?? 0.25);
+    const bench = window.__bench = { frames: 0, firstFrame: null, frameWork: null };
+
+    const main = document.getElementById('main');
+    main.width = Math.round(innerWidth * devicePixelRatio);
+    main.height = Math.round(innerHeight * devicePixelRatio);
+    const ctx = main.getContext('2d');
+
+    const Count = 24;
+    const Columns = 6;
+    const Width = 392;
+    const Height = 120;
+    const CameraDistance = 1200;
+    const colors = ['#6750A4', '#00897B', '#E53935', '#FB8C00', '#3949AB', '#43A047', '#8E24AA', '#00ACC1'];
+
+    function drawContent(target, index, x, y) {
+        target.fillStyle = colors[index % colors.length];
+        target.beginPath();
+        target.roundRect(x, y, Width, Height, 24);
+        target.fill();
+        target.fillStyle = 'white';
+        target.font = 'bold 28px sans-serif';
+        target.fillText('Card ' + (index + 1), x + 24, y + 52);
+    }
+
+    // The raster of a card has a transparent pixel around it, which smooths its edges.
+    const RasterWidth = Width + 2;
+    const RasterHeight = Height + 2;
+
+    function center(index) {
+        return {
+            x: 24 + (index % Columns) * 412 + Width / 2,
+            y: 24 + Math.floor(index / Columns) * 160 + Height / 2,
+        };
+    }
+
+    // The 3x3 matrix (row by row) mapping the texture coordinates of a raster to the device, and
+    // the device bounds of the result.
+    function projection(index, time) {
+        const { x: cx, y: cy } = center(index);
+        const angle = Math.sin(time * 2 + index * 0.3) * Math.PI / 3;
+        const s = Math.sin(angle);
+        const c = Math.cos(angle);
+        const d = CameraDistance;
+        const w = RasterWidth;
+        const h = RasterHeight;
+        const m = [
+            (cx * s + d * c) * w, 0, cx * d - (cx * s + d * c) * w / 2,
+            cy * s * w, d * h, cy * d - cy * s * w / 2 - d * h / 2,
+            s * w, 0, d - s * w / 2,
+        ];
+        let left = Infinity, top = Infinity, right = -Infinity, bottom = -Infinity;
+        for (const [u, v] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
+            const z = m[6] * u + m[7] * v + m[8];
+            const px = (m[0] * u + m[1] * v + m[2]) / z;
+            const py = (m[3] * u + m[4] * v + m[5]) / z;
+            left = Math.min(left, px); top = Math.min(top, py);
+            right = Math.max(right, px); bottom = Math.max(bottom, py);
+        }
+        left = Math.floor(left); top = Math.floor(top);
+        return { m, left, top, width: Math.ceil(right) - left, height: Math.ceil(bottom) - top };
+    }
+
+    // WebGL, as the renderer sets it up: a <canvas> element whose drawing buffer is preserved.
+    const transfers = variant === 'batchedAtlasTransfer';
+    const glCanvas = transfers ? new OffscreenCanvas(2560, 1024) : document.createElement('canvas');
+    glCanvas.width = 2560;
+    glCanvas.height = 1024;
+    const gl = glCanvas.getContext('webgl2', {
+        premultipliedAlpha: true,
+        preserveDrawingBuffer: variant !== 'batchedAtlasNoPreserve' && !transfers,
+    });
+    function compile(type, source) {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        return shader;
+    }
+    const program = gl.createProgram();
+    gl.attachShader(program, compile(gl.VERTEX_SHADER, `#version 300 es
+in vec2 aUv;
+uniform mat3 uMatrix;
+uniform vec4 uTarget;
+uniform vec4 uSlot;
+out vec2 vUv;
+void main() {
+    vec3 p = uMatrix * vec3(aUv, 1.0);
+    gl_Position = vec4(
+        (p.x - uTarget.x * p.z) * (2.0 / uTarget.z) - p.z,
+        p.z - (p.y - uTarget.y * p.z) * (2.0 / uTarget.w),
+        0.0,
+        p.z);
+    vUv = uSlot.xy + aUv * uSlot.zw;
+}`));
+    gl.attachShader(program, compile(gl.FRAGMENT_SHADER, `#version 300 es
+precision highp float;
+uniform sampler2D uTexture;
+in vec2 vUv;
+out vec4 outColor;
+void main() {
+    outColor = texture(uTexture, vUv);
+}`));
+    gl.linkProgram(program);
+    gl.useProgram(program);
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]), gl.STATIC_DRAW);
+    const uvLocation = gl.getAttribLocation(program, 'aUv');
+    gl.enableVertexAttribArray(uvLocation);
+    gl.vertexAttribPointer(uvLocation, 2, gl.FLOAT, false, 0, 0);
+    const matrixLocation = gl.getUniformLocation(program, 'uMatrix');
+    const targetLocation = gl.getUniformLocation(program, 'uTarget');
+    const slotLocation = gl.getUniformLocation(program, 'uSlot');
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+    const matrixValues = new Float32Array(9);
+
+    function newTexture() {
+        const texture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        return texture;
+    }
+    const textures = Array.from({ length: Count }, newTexture);
+
+    // Draws the raster bound to the texture unit in perspective into the area of the WebGL canvas
+    // whose top-left corner is (x, y).
+    function project(p, slot, x, y) {
+        gl.viewport(x, glCanvas.height - y - p.height, p.width, p.height);
+        const m = p.m;
+        matrixValues[0] = m[0]; matrixValues[1] = m[3]; matrixValues[2] = m[6];
+        matrixValues[3] = m[1]; matrixValues[4] = m[4]; matrixValues[5] = m[7];
+        matrixValues[6] = m[2]; matrixValues[7] = m[5]; matrixValues[8] = m[8];
+        gl.uniformMatrix3fv(matrixLocation, false, matrixValues);
+        gl.uniform4f(targetLocation, p.left, p.top, p.width, p.height);
+        gl.uniform4f(slotLocation, slot[0], slot[1], slot[2], slot[3]);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+
+    const raster = document.createElement('canvas');
+    raster.width = RasterWidth;
+    raster.height = RasterHeight;
+    const rasterCtx = raster.getContext('2d');
+
+    const AtlasColumns = 6;
+    const atlas = document.createElement('canvas');
+    atlas.width = AtlasColumns * (RasterWidth + 1);
+    atlas.height = Math.ceil(Count / AtlasColumns) * (RasterHeight + 1);
+    const atlasCtx = atlas.getContext('2d');
+    const atlasTexture = newTexture();
+
+    // Draws the raster at (ax, ay) in the atlas, mapped to the device by the projection m (texture
+    // coordinates u, v in 0..1, turning around the vertical axis: m[1] = m[7] = 0), as strips.
+    function drawStrips(m, ax, ay) {
+        const z = (u) => m[6] * u + m[8];
+        const deviceX = (u) => (m[0] * u + m[2]) / z(u);
+        const uAt = (x) => (m[2] - m[8] * x) / (m[6] * x - m[0]);
+        const top = (u) => (m[3] * u + m[5]) / z(u);
+        const height = (u) => m[4] / z(u);
+        // The height changes linearly with x: the error of a strip is that slope times its width.
+        const slope = Math.abs(m[4] * m[6] / (m[0] * m[8] - m[2] * m[6]));
+        const width = Math.max(1, Math.floor(2 * maxError / slope));
+        const x0 = deviceX(0), x1 = deviceX(1);
+        const flipped = x1 < x0;
+        const start = Math.min(x0, x1), end = Math.max(x0, x1);
+        for (let x = Math.floor(start); x < end; x += width) {
+            let ua = uAt(Math.max(x, start)), ub = uAt(Math.min(x + width, end));
+            if (flipped) [ua, ub] = [ub, ua];
+            ua = Math.min(Math.max(ua, 0), 1);
+            ub = Math.min(Math.max(ub, 0), 1);
+            if (ub <= ua) continue;
+            const left = deviceX(ua), right = deviceX(ub);
+            ctx.setTransform(right - left, top(ub) - top(ua), 0, height((ua + ub) / 2), left, top(ua));
+            ctx.drawImage(atlas, ax + ua * RasterWidth, ay, (ub - ua) * RasterWidth, RasterHeight, 0, 0, 1, 1);
+        }
+    }
+
+    function drawFrame(time) {
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, main.width, main.height);
+        if (variant === 'flat') {
+            for (let i = 0; i < Count; i++) {
+                const { x, y } = center(i);
+                drawContent(ctx, i, x - Width / 2, y - Height / 2);
+            }
+            return;
+        }
+        const projections = Array.from({ length: Count }, (_, i) => projection(i, time));
+        if (variant !== 'strips') {
+            gl.clearColor(0, 0, 0, 0);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            gl.activeTexture(gl.TEXTURE0);
+        }
+        if (variant === 'perLayer') {
+            for (let i = 0; i < Count; i++) {
+                const p = projections[i];
+                rasterCtx.clearRect(0, 0, RasterWidth, RasterHeight);
+                drawContent(rasterCtx, i, 1, 1);
+                gl.bindTexture(gl.TEXTURE_2D, textures[0]);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, RasterWidth, RasterHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, raster);
+                gl.generateMipmap(gl.TEXTURE_2D);
+                project(p, [0, 0, 1, 1], 0, 0);
+                ctx.drawImage(glCanvas, 0, 0, p.width, p.height, p.left, p.top, p.width, p.height);
+            }
+            return;
+        }
+        // Batched: the content of all the cards first.
+        atlasCtx.clearRect(0, 0, atlas.width, atlas.height);
+        for (let i = 0; i < Count; i++) {
+            const ax = (i % AtlasColumns) * (RasterWidth + 1);
+            const ay = Math.floor(i / AtlasColumns) * (RasterHeight + 1);
+            drawContent(atlasCtx, i, ax + 1, ay + 1);
+        }
+        if (variant === 'strips') {
+            for (let i = 0; i < Count; i++) {
+                const ax = (i % AtlasColumns) * (RasterWidth + 1);
+                const ay = Math.floor(i / AtlasColumns) * (RasterHeight + 1);
+                drawStrips(projections[i].m, ax, ay);
+            }
+            ctx.setTransform(1, 0, 0, 1, 0, 0);
+            return;
+        }
+        const usesAtlasTexture = variant.startsWith('batchedAtlas');
+        if (usesAtlasTexture) {
+            const mipmaps = !variant.endsWith('NoMip');
+            gl.bindTexture(gl.TEXTURE_2D, atlasTexture);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, mipmaps ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
+            if (variant.startsWith('batchedAtlasSub')) {
+                if (!atlasTexture.allocated) {
+                    const levels = mipmaps ? Math.floor(Math.log2(Math.max(atlas.width, atlas.height))) + 1 : 1;
+                    gl.texStorage2D(gl.TEXTURE_2D, levels, gl.RGBA8, atlas.width, atlas.height);
+                    atlasTexture.allocated = true;
+                }
+                gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, atlas);
+            } else {
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, atlas);
+            }
+            if (mipmaps) gl.generateMipmap(gl.TEXTURE_2D);
+        }
+        // Then all the projections, into separate parts of the WebGL canvas.
+        const slots = [];
+        let x = 0, y = 0, rowHeight = 0;
+        for (let i = 0; i < Count; i++) {
+            const p = projections[i];
+            if (x + p.width > glCanvas.width) { x = 0; y += rowHeight + 1; rowHeight = 0; }
+            const ax = (i % AtlasColumns) * (RasterWidth + 1);
+            const ay = Math.floor(i / AtlasColumns) * (RasterHeight + 1);
+            let slot;
+            if (usesAtlasTexture) {
+                slot = [ax / atlas.width, ay / atlas.height, RasterWidth / atlas.width, RasterHeight / atlas.height];
+            } else {
+                gl.bindTexture(gl.TEXTURE_2D, textures[i]);
+                gl.pixelStorei(gl.UNPACK_SKIP_PIXELS, ax);
+                gl.pixelStorei(gl.UNPACK_SKIP_ROWS, ay);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, RasterWidth, RasterHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, atlas);
+                gl.generateMipmap(gl.TEXTURE_2D);
+                slot = [0, 0, 1, 1];
+            }
+            project(p, slot, x, y);
+            slots.push([x, y]);
+            x += p.width + 1;
+            rowHeight = Math.max(rowHeight, p.height);
+        }
+        gl.pixelStorei(gl.UNPACK_SKIP_PIXELS, 0);
+        gl.pixelStorei(gl.UNPACK_SKIP_ROWS, 0);
+        // Then the composites.
+        const projected = transfers ? glCanvas.transferToImageBitmap() : glCanvas;
+        for (let i = 0; i < Count; i++) {
+            const p = projections[i];
+            const [sx, sy] = slots[i];
+            ctx.drawImage(projected, sx, sy, p.width, p.height, p.left, p.top, p.width, p.height);
+        }
+        if (transfers) projected.close();
+    }
+
+    let start = null;
+    function frame(timestamp) {
+        if (start === null) start = timestamp;
+        const workStart = performance.now();
+        drawFrame(frozenTime ?? (timestamp - start) / 1000);
+        if (bench.frameWork) bench.frameWork.push(performance.now() - workStart);
+        bench.frames++;
+        if (bench.firstFrame === null) bench.firstFrame = performance.now();
+        requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+</script>
+</body>
+</html>
