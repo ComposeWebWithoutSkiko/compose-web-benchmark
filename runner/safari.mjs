@@ -227,6 +227,12 @@ const buildsOf = (run) => (run % 2 === 0 ? builds : [...builds].reverse());
 
 const ms = (value) => `${value.toFixed(0)} ms`;
 
+await mkdir(join(projectDir, 'results'), { recursive: true });
+const file = join(projectDir, 'results', `${results.date.replace(/[:.]/g, '-')}-safari.json`);
+
+/** Saves what has been measured: a run that ends early, e.g. on a locked screen, keeps it. */
+const save = () => writeFile(file, JSON.stringify(results, null, 2));
+
 try {
     if (suites.includes('startup')) {
         for (const target of targets) {
@@ -250,6 +256,7 @@ try {
                     log(`startup ${target} ${build}: cold ${loads.cold}, warm ${loads.warm}`);
                 }
             }
+            await save();
         }
     }
     if (suites.includes('runtime')) {
@@ -278,6 +285,7 @@ try {
                         log(`${scenario} ${target} ${build}: ${(frames / seconds).toFixed(0)} fps ${problems(result)}`);
                     }
                 }
+                await save();
             }
         }
     }
@@ -285,7 +293,4 @@ try {
     server.close();
 }
 
-await mkdir(join(projectDir, 'results'), { recursive: true });
-const file = join(projectDir, 'results', `${results.date.replace(/[:.]/g, '-')}-safari.json`);
-await writeFile(file, JSON.stringify(results, null, 2));
 log(`Results: ${file}`);

@@ -5,7 +5,7 @@ Viewport 1280×800 CSS px at 2×. 2026-10-30T19:29:19.070Z.
 
 Compose: upstream `1.13.0-beta01` against the fork at `3dbb0d27622`. Built and measured with
 the sources of this repository; the raw results are not kept here, `runner/run.mjs` measures them
-again. Safari has not been measured on this code yet.
+again. For Safari, see [safari.md](safari.md).
 
 ### Download size of the startup screen
 
