@@ -17,7 +17,7 @@ plugins {
 val composeBuild = providers.gradleProperty("compose").getOrElse("upstream")
 val composeVersion = when (composeBuild) {
     "upstream" -> "1.13.0-beta01"
-    "webcanvas" -> "1.13.0-beta01-webcanvas"
+    "webcanvas" -> "1.13.0-beta01-webcanvas.1"
     else -> error("Unknown -Pcompose=$composeBuild, expected upstream or webcanvas")
 }
 

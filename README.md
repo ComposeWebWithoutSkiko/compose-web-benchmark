@@ -116,20 +116,11 @@ Raw results are large and stay out of the repository: the commands below measure
 Requirements: JDK 17+, Node.js 22+, Google Chrome; for `runner/safari.mjs`, macOS and Safari.
 
 ```sh
-# 1. The Canvas 2D build of Compose, into Maven Local as 1.13.0-beta01-webcanvas:
-git clone -b web-canvas/1.13 https://github.com/ComposeWebWithoutSkiko/compose-multiplatform-core
-cd compose-multiplatform-core
-./gradlew :mpp:publishComposeJbToMavenLocal -Pcompose.platforms=web \
-    -Pjetbrains.publication.libraries=COMPOSE,COMPOSE_MATERIAL3 \
-    -Pjetbrains.publication.version.COMPOSE=1.13.0-beta01-webcanvas \
-    -Pjetbrains.publication.version.COMPOSE_MATERIAL3=1.13.0-beta01-webcanvas
-
-# 2. Both builds of the app:
-cd ../compose-web-benchmark
+# 1. Both builds of the app. The Canvas 2D build of Compose comes from https://repo.redlance.org/public:
 ./gradlew -Pcompose=upstream wasmJsBrowserDistribution jsBrowserDistribution
 ./gradlew -Pcompose=webcanvas wasmJsBrowserDistribution jsBrowserDistribution
 
-# 3. The benchmark (about 15 minutes), then the tables:
+# 2. The benchmark (about 15 minutes), then the tables:
 node runner/run.mjs
 node runner/summarize.mjs results/<time>.json
 
@@ -137,7 +128,8 @@ node runner/summarize.mjs results/<time>.json
 node runner/safari.mjs
 node runner/summarize.mjs results/<time>-safari.json
 
-# With Haze, its fork cloned next to this repository, which builds with JDK 25 and its own Gradle:
+# With Haze. Its fork is published for wasmJs only and this app also builds js, so clone it next to
+# this repository; it builds with JDK 25 and its own Gradle:
 git clone -b web-canvas/2.0 https://github.com/ComposeWebWithoutSkiko/haze ../haze
 ../haze/gradlew -p haze -Pcompose=upstream wasmJsBrowserDistribution jsBrowserDistribution
 ../haze/gradlew -p haze -Pcompose=webcanvas wasmJsBrowserDistribution jsBrowserDistribution
