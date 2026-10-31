@@ -6,6 +6,7 @@ Viewport 1280×800 CSS px at 2×. 2026-10-30T23:41:23.732Z.
 Compose: upstream `1.13.0-beta01` against the fork at `3dbb0d27622`. Safari draws at the refresh
 rate of the display, so the frame rates are capped and the CPU and main thread time per frame
 compare the builds. The raw results are not kept here, `runner/safari.mjs` measures them again.
+This commit is older than the one of [chrome.md](chrome.md): the effects of layers have changed since.
 
 ### Time to the first frame (median)
 

@@ -1,7 +1,7 @@
 // Runs the benchmark in Chrome and writes the raw results to results/<time>.json.
 //
 //   node runner/run.mjs [--suites startup,throttled,runtime,i18n] [--builds upstream,webcanvas]
-//                       [--targets wasmJs,js] [--runs 10] [--headed]
+//                       [--targets wasmJs,js] [--runs 10] [--headed] [--app haze]
 //
 // The builds alternate within every repetition, so that a change of the machine's state (heat,
 // background work) affects both alike.
@@ -25,6 +25,8 @@ const { values: options } = parseArgs({
             default: 'scroll,layers,fade,churn,filters,blur,nested,perspective,elevation,shadows,cutshadows,cardscroll,blend,canvas,text,effects',
         },
         headed: { type: 'boolean', default: false },
+        // An app other than the benchmark's, built to build/<build>-<app>.
+        app: { type: 'string' },
     },
 });
 const suites = options.suites.split(',');
@@ -66,7 +68,8 @@ const results = {
 };
 
 function urlOf(build, target, scenario) {
-    return `${server.origin}/${build}/${target}/index.html?scenario=${scenario}`;
+    const directory = options.app ? `${build}-${options.app}` : build;
+    return `${server.origin}/${directory}/${target}/index.html?scenario=${scenario}`;
 }
 
 async function preparePage(page, { cacheDisabled = false, throttled = false } = {}) {

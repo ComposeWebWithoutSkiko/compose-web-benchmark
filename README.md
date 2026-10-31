@@ -90,11 +90,26 @@ is hidden, the runner waits for it to be shown and measures it again. It brings 
 only when it starts. It saves its results after every scenario, so a run that ends early keeps
 them; `summarize.mjs` combines them with a run of the remaining `--scenarios`.
 
+### With Haze
+
+[`haze/`](haze) is an app of its own, so that a library the benchmark's app doesn't need stays out
+of the numbers above: [Haze](https://github.com/chrisbanes/haze) `2.0.1` from Maven Central on
+upstream Compose, against
+[the fork of Haze](https://github.com/ComposeWebWithoutSkiko/haze/tree/web-canvas/2.0) on the Canvas
+2D build. Panels of 340×340 CSS px over stripes that move in every frame:
+
+| scenario | what it does |
+|---|---|
+| `panels` | six panels: a blur with noise under a tint, a plain blur, a mask, a background under a gradient tint, and a progressive blur at the default performance mode and at `Quality` |
+| `panel` | only the first one |
+
+`runner/run.mjs --app haze` measures them like the other scenarios, and in Chrome only.
+
 ## Results
 
-[`results/chrome.md`](results/chrome.md) and [`results/safari.md`](results/safari.md) have the
-tables measured in Chrome and in Safari. Raw results are large and stay out of the repository: the
-commands below measure them again.
+[`results/chrome.md`](results/chrome.md), [`results/safari.md`](results/safari.md) and
+[`results/haze.md`](results/haze.md) have the tables measured in Chrome, in Safari and with Haze.
+Raw results are large and stay out of the repository: the commands below measure them again.
 
 ## Running it
 
@@ -122,6 +137,13 @@ node runner/summarize.mjs results/<time>.json
 node runner/safari.mjs
 node runner/summarize.mjs results/<time>-safari.json
 
+# With Haze, its fork cloned next to this repository, which builds with JDK 25 and its own Gradle:
+git clone -b web-canvas/2.0 https://github.com/ComposeWebWithoutSkiko/haze ../haze
+../haze/gradlew -p haze -Pcompose=upstream wasmJsBrowserDistribution jsBrowserDistribution
+../haze/gradlew -p haze -Pcompose=webcanvas wasmJsBrowserDistribution jsBrowserDistribution
+node runner/run.mjs --app haze --suites startup,runtime --scenarios panels,panel --runs 5
+node runner/summarize.mjs results/<time>.json
+
 # Bundle sizes of the builds, file by file; screenshots of every scenario of both builds:
 node runner/sizes.mjs
 node runner/screenshots.mjs
@@ -132,8 +154,9 @@ node runner/server.mjs 8080
 
 Options of `runner/run.mjs`: `--suites startup,throttled,runtime,i18n`,
 `--builds upstream,webcanvas`, `--targets wasmJs,js`, `--runs 10` (startup loads per build;
-half as many throttled ones), `--scenarios` (the animated scenarios, all by default), `--headed`.
-`runner/safari.mjs` takes the same but `--headed`, with `--suites startup,runtime`.
+half as many throttled ones), `--scenarios` (the animated scenarios, all by default), `--headed`,
+`--app haze` (the app of `haze/`).
+`runner/safari.mjs` takes the same but `--headed` and `--app`, with `--suites startup,runtime`.
 
 `runner/sizes.mjs` lists every file of a bundle, including ones that aren't loaded: webpack puts
 `skiko.wasm` in the upstream `js` bundle twice, and the page loads one of them. The download size
