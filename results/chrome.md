@@ -3,15 +3,16 @@
 Chrome/156.0.8078.74 on Apple M4 Pro (12 cores, 24 GB), darwin 24.6.0 arm64; GPU: ANGLE (Apple, ANGLE Metal Renderer: Apple M4 Pro, Unspecified Version).
 Viewport 1280×800 CSS px at 2×. 2026-10-30T19:29:19.070Z.
 
-Compose: upstream `1.13.0-beta01` against the fork at `3dbb0d27622`. Built and measured with
-the sources of this repository; the raw results are not kept here, `runner/run.mjs` measures them
-again. For Safari, see [safari.md](safari.md).
+Compose: upstream `1.13.0-beta01` against the fork at `3dbb0d27622`. The download sizes of the
+Canvas 2D `wasmJs` build are from `733aba97c69`, which drops `@js-joda/core`; the times weren't
+measured again. Built and measured with the sources of this repository; the raw results are not
+kept here, `runner/run.mjs` measures them again. For Safari, see [safari.md](safari.md).
 
 ### Download size of the startup screen
 
 | target | upstream (brotli) | Canvas 2D (brotli) | smaller by |
 |---|---|---|---|
-| wasmJs | 3077 KiB (10569 KiB raw) | 588 KiB (2310 KiB raw) | 5.2× |
+| wasmJs | 3077 KiB (10569 KiB raw) | 545 KiB (2075 KiB raw) | 5.6× |
 | js | 3074 KiB (11600 KiB raw) | 627 KiB (3416 KiB raw) | 4.9× |
 
 ### Time to the first frame (median)
@@ -30,7 +31,7 @@ again. For Safari, see [safari.md](safari.md).
 | target | build | first frame (median) | app download | fonts downloaded (median) |
 |---|---|---|---|---|
 | wasmJs | upstream | 208 ms (n=3) | 3078 KiB | 28 files, 1213 KiB, the last at 4246 ms |
-| wasmJs | webcanvas | 92 ms (n=3) | 588 KiB | 0 files, 0 KiB |
+| wasmJs | webcanvas | 92 ms (n=3) | 545 KiB | 0 files, 0 KiB |
 | js | upstream | 382 ms (n=3) | 3075 KiB | 28 files, 1213 KiB, the last at 4361 ms |
 | js | webcanvas | 184 ms (n=3) | 628 KiB | 0 files, 0 KiB |
 

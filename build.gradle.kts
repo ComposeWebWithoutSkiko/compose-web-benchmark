@@ -1,4 +1,8 @@
 import org.jetbrains.kotlin.gradle.ExperimentalWasmDsl
+import org.jetbrains.kotlin.gradle.targets.js.yarn.YarnPlugin
+import org.jetbrains.kotlin.gradle.targets.js.yarn.YarnRootExtension
+import org.jetbrains.kotlin.gradle.targets.wasm.yarn.WasmYarnPlugin
+import org.jetbrains.kotlin.gradle.targets.wasm.yarn.WasmYarnRootExtension
 
 plugins {
     kotlin("multiplatform") version "2.4.20"
@@ -19,6 +23,15 @@ val composeVersion = when (composeBuild) {
 
 // The builds don't share outputs, so both stay ready to be served.
 layout.buildDirectory = layout.projectDirectory.dir("build/$composeBuild")
+
+// The builds have different npm dependencies, so each keeps its own locks. They must otherwise
+// stay the same, so upgrade them together.
+plugins.withType<YarnPlugin> {
+    the<YarnRootExtension>().lockFileDirectory = file("kotlin-js-store/$composeBuild")
+}
+plugins.withType<WasmYarnPlugin> {
+    the<WasmYarnRootExtension>().lockFileDirectory = file("kotlin-js-store/$composeBuild/wasm")
+}
 
 kotlin {
     js {
