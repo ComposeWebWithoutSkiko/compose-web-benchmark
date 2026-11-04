@@ -1,5 +1,5 @@
-// Runs the benchmark in Safari and writes the raw results to results/<time>.json, in the format of
-// run.mjs. Safari has no DevTools protocol to drive it, so the runner opens every page in a window
+// Runs the benchmark in Safari and writes the raw results to results/<time>-safari.json, in the format
+// of run.mjs. Safari has no DevTools protocol to drive it, so the runner opens every page in a window
 // of its own in the running Safari through AppleScript, and the page measures itself (index.html)
 // and posts what it measured to the server. What differs from run.mjs:
 // - Safari draws at the refresh rate of the display, so the frame rate of a scenario is capped, and
@@ -19,12 +19,13 @@
 // the front once, when it starts, and never again, so as not to take the keyboard from other apps.
 
 import { execFileSync } from 'node:child_process';
-import { mkdir, writeFile } from 'node:fs/promises';
-import { arch, cpus, release, totalmem } from 'node:os';
-import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { parseArgs } from 'node:util';
-import { projectDir, startServer } from './server.mjs';
+import {
+    animatedScenarioNames, buildsOf, log, machine, measureMs, resultsFile, scenarioPath, viewport, warmupMs,
+} from './common.mjs';
+import { parseCpuTime } from './ps.mjs';
+import { startServer } from './server.mjs';
 
 const { values: options } = parseArgs({
     options: {
@@ -32,10 +33,7 @@ const { values: options } = parseArgs({
         builds: { type: 'string', default: 'upstream,webcanvas' },
         targets: { type: 'string', default: 'wasmJs,js' },
         runs: { type: 'string', default: '10' },
-        scenarios: {
-            type: 'string',
-            default: 'scroll,layers,fade,churn,filters,blur,nested,perspective,elevation,shadows,cutshadows,cardscroll,blend,canvas,text,effects',
-        },
+        scenarios: { type: 'string', default: animatedScenarioNames.join(',') },
     },
 });
 const suites = options.suites.split(',');
@@ -44,16 +42,8 @@ const targets = options.targets.split(',');
 const runs = Number(options.runs);
 const animatedScenarios = options.scenarios.split(',');
 
-/** The viewport of run.mjs, in CSS pixels. */
-const viewport = { width: 1280, height: 800 };
-const warmupMs = 3000;
-const measureMs = 5000;
 /** How long a page that isn't hidden may take to report what it measured. */
 const reportTimeoutMs = 120_000;
-
-function log(message) {
-    console.log(`[${new Date().toISOString().slice(11, 19)}] ${message}`);
-}
 
 function appleScript(script) {
     return execFileSync('osascript', ['-e', script], { encoding: 'utf8' }).trim();
@@ -84,12 +74,6 @@ process.on('SIGINT', () => {
     for (const id of openWindows) closeWindow(id);
     process.exit(130);
 });
-
-/** The seconds of a CPU time printed by `ps`: [[days-]hours:]minutes:seconds. */
-function parseCpuTime(time) {
-    const [days, clock] = time.includes('-') ? time.split('-') : ['0', time];
-    return Number(days) * 86_400 + clock.split(':').reduce((sum, part) => sum * 60 + Number(part), 0);
-}
 
 /** The CPU time in seconds of every WebKit page process and GPU process, by process id. */
 function webKitCpuTimes() {
@@ -186,7 +170,7 @@ function failure(result) {
 const problems = (result) => [...result.errors, ...result.console].join('; ');
 
 /** The path of the startup screen of [build] for [target], as visit [visitId] loads it. */
-const startupPath = (visitId, build, target) => `/v/${visitId}/${build}/${target}/index.html?scenario=startup`;
+const startupPath = (visitId, build, target) => `/v/${visitId}${scenarioPath(build, target, 'startup')}`;
 
 /** A token of this invocation of the runner: the paths of its visits are new to Safari. */
 const session = Date.now().toString(36);
@@ -205,7 +189,7 @@ if (!check.data) throw new Error(`The page failed: ${JSON.stringify(failure(chec
 
 const results = {
     date: new Date().toISOString(),
-    machine: { cpu: cpus()[0].model, cores: cpus().length, memoryGb: Math.round(totalmem() / 2 ** 30), os: `${process.platform} ${release()} ${arch()}` },
+    machine: machine(),
     browser: `Safari/${/Version\/([\d.]+)/.exec(userAgent)?.[1] ?? userAgent}`,
     gpu,
     viewport: check.data.viewport,
@@ -222,16 +206,10 @@ if (results.viewport.width !== viewport.width || results.viewport.height !== vie
     log(`The viewport isn't ${viewport.width}x${viewport.height}: the screen may be too small for the window`);
 }
 
-/** The builds in the order of repetition [run]: alternating, so neither always goes first. */
-const buildsOf = (run) => (run % 2 === 0 ? builds : [...builds].reverse());
-
 const ms = (value) => `${value.toFixed(0)} ms`;
 
-await mkdir(join(projectDir, 'results'), { recursive: true });
-const file = join(projectDir, 'results', `${results.date.replace(/[:.]/g, '-')}-safari.json`);
-
-/** Saves what has been measured: a run that ends early, e.g. on a locked screen, keeps it. */
-const save = () => writeFile(file, JSON.stringify(results, null, 2));
+/** Saved after every scenario: a run that ends early, e.g. on a locked screen, keeps what it measured. */
+const { file, save } = await resultsFile(results, '-safari');
 
 try {
     if (suites.includes('startup')) {
@@ -242,7 +220,7 @@ try {
                 for (let i = 0; i < 2; i++) await visit(startupPath(`${session}-warm`, build, target), '', { lingerMs: 2000 });
             }
             for (let run = 0; run < runs; run++) {
-                for (const build of buildsOf(run)) {
+                for (const build of buildsOf(builds, run)) {
                     const loads = {};
                     for (const kind of ['cold', 'warm']) {
                         const visitId = kind === 'cold' ? `${session}-${nextVisit++}` : `${session}-warm`;
@@ -263,8 +241,8 @@ try {
         for (const target of targets) {
             for (const scenario of animatedScenarios) {
                 for (let run = 0; run < 3; run++) {
-                    for (const build of buildsOf(run)) {
-                        const result = await visit(`/${build}/${target}/index.html?scenario=${scenario}`, `&warmup=${warmupMs}&measure=${measureMs}`);
+                    for (const build of buildsOf(builds, run)) {
+                        const result = await visit(scenarioPath(build, target, scenario), `&warmup=${warmupMs}&measure=${measureMs}`);
                         if (!result.data) {
                             results.runtime.push({ build, target, scenario, ...failure(result) });
                             log(`${scenario} ${target} ${build}: ${failure(result).failed} ${problems(result)}`);

@@ -1,5 +1,5 @@
-// Turns results files of run.mjs or safari.mjs into Markdown tables. Several files, e.g. of runs of
-// different suites, are combined; the machine and browser are those of the first.
+// Turns results files of run.mjs, safari.mjs or firefox.mjs into Markdown tables. Several files,
+// e.g. of runs of different suites, are combined; the machine and browser are those of the first.
 //
 //   node runner/summarize.mjs results/<time>.json...
 

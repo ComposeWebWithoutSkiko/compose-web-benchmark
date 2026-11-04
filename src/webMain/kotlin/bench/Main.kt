@@ -7,6 +7,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.window.ComposeViewport
 
 /** The app: the scenario named by the `scenario` query parameter, `startup` by default. */
@@ -27,6 +28,11 @@ private fun Bench(scenario: String) {
                 "fade" -> Fade()
                 "churn" -> Churn()
                 "filters" -> Filters()
+                "imagebrush" -> ImageBrush()
+                "gradientbrush" -> GradientBrush()
+                "compositebrush" -> CompositeBrush()
+                "softlight" -> SoftLight()
+                "newcontent" -> NewContent()
                 "blur" -> Blur()
                 "nested" -> Nested()
                 "perspective" -> Perspective()
@@ -34,7 +40,9 @@ private fun Bench(scenario: String) {
                 "shadows" -> Shadows(cutCorners = false)
                 "cutshadows" -> Shadows(cutCorners = true)
                 "cardscroll" -> CardScroll()
-                "blend" -> Blend()
+                "cardlist" -> CardList()
+                "blend" -> Blend(BlendMode.Multiply)
+                "softlightlayers" -> Blend(BlendMode.Softlight)
                 "canvas" -> Shapes()
                 "text" -> Reflow()
                 "effects" -> Effects()

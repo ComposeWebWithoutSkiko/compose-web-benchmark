@@ -14,7 +14,7 @@ plugins {
 val composeBuild = providers.gradleProperty("compose").getOrElse("upstream")
 val composeVersion = when (composeBuild) {
     "upstream" -> "1.13.0-beta01"
-    "webcanvas" -> "1.13.0-beta01-webcanvas.1"
+    "webcanvas" -> "1.13.0-beta01-webcanvas.5"
     else -> error("Unknown -Pcompose=$composeBuild, expected upstream or webcanvas")
 }
 
@@ -49,8 +49,8 @@ kotlin {
                 implementation("org.jetbrains.compose.runtime:runtime:$composeVersion")
                 implementation("org.jetbrains.compose.foundation:foundation:$composeVersion")
                 implementation("org.jetbrains.compose.ui:ui:$composeVersion")
-                implementation("dev.chrisbanes.haze:haze:2.0.1")
-                implementation("dev.chrisbanes.haze:haze-blur:2.0.1")
+                implementation("dev.chrisbanes.haze:haze:2.1.0")
+                implementation("dev.chrisbanes.haze:haze-blur:2.1.0")
             }
         }
     }

@@ -7,42 +7,40 @@
 // background work) affects both alike.
 
 import { mkdir, writeFile } from 'node:fs/promises';
-import { arch, cpus, release, totalmem } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { parseArgs } from 'node:util';
 import { launchChrome } from './chrome.mjs';
+import {
+    appOf, buildsOf, log, machine, measureMs, resultsFile, scenarioPath, viewport, warmupMs,
+} from './common.mjs';
+import { frameCount, gpuName, startFrameWork, takeFrameWork } from './probes.mjs';
 import { projectDir, startServer } from './server.mjs';
 
 const { values: options } = parseArgs({
     options: {
-        suites: { type: 'string', default: 'startup,throttled,runtime,i18n' },
+        // All of them by default, i18n only for an app that has the text in many scripts.
+        suites: { type: 'string' },
         builds: { type: 'string', default: 'upstream,webcanvas' },
         targets: { type: 'string', default: 'wasmJs,js' },
         runs: { type: 'string', default: '10' },
-        scenarios: {
-            type: 'string',
-            default: 'scroll,layers,fade,churn,filters,blur,nested,perspective,elevation,shadows,cutshadows,cardscroll,blend,canvas,text,effects',
-        },
+        // The animated scenarios of the app, all of them by default.
+        scenarios: { type: 'string' },
         headed: { type: 'boolean', default: false },
         // An app other than the benchmark's, built to build/<build>-<app>.
         app: { type: 'string' },
     },
 });
-const suites = options.suites.split(',');
+const app = appOf(options.app);
+const suites = options.suites?.split(',') ?? ['startup', 'throttled', 'runtime', ...(app.i18n ? ['i18n'] : [])];
 const builds = options.builds.split(',');
 const targets = options.targets.split(',');
 const runs = Number(options.runs);
 
-/** A laptop screen: 1280x800 CSS pixels at 2 device pixels per CSS pixel. */
-const viewport = { width: 1280, height: 800, deviceScaleFactor: 2, mobile: false };
-
 /** A mid-range phone on mobile internet: a 4x slower CPU, 10 Mbit/s down, 2 Mbit/s up, 100 ms RTT. */
 const throttling = { cpuRate: 4, latency: 100, downloadThroughput: 10e6 / 8, uploadThroughput: 2e6 / 8 };
 
-const animatedScenarios = options.scenarios.split(',');
-const warmupMs = 3000;
-const measureMs = 5000;
+const animatedScenarios = options.scenarios?.split(',') ?? app.animatedScenarios;
 
 const server = await startServer();
 // Uncapped frames: the frame rate of an animated scenario is then the throughput of the
@@ -54,7 +52,7 @@ const chrome = await launchChrome({
 
 const results = {
     date: new Date().toISOString(),
-    machine: { cpu: cpus()[0].model, cores: cpus().length, memoryGb: Math.round(totalmem() / 2 ** 30), os: `${process.platform} ${release()} ${arch()}` },
+    machine: machine(),
     browser: (await chrome.send('Browser.getVersion')).product,
     gpu: null,
     viewport,
@@ -68,12 +66,11 @@ const results = {
 };
 
 function urlOf(build, target, scenario) {
-    const directory = options.app ? `${build}-${options.app}` : build;
-    return `${server.origin}/${directory}/${target}/index.html?scenario=${scenario}`;
+    return server.origin + scenarioPath(build, target, scenario, options.app);
 }
 
 async function preparePage(page, { cacheDisabled = false, throttled = false } = {}) {
-    await page.send('Emulation.setDeviceMetricsOverride', viewport);
+    await page.send('Emulation.setDeviceMetricsOverride', { ...viewport, mobile: false });
     await page.send('Network.setCacheDisabled', { cacheDisabled });
     if (throttled) {
         await page.send('Emulation.setCPUThrottlingRate', { rate: throttling.cpuRate });
@@ -140,8 +137,6 @@ async function processTimes() {
     return processInfo;
 }
 
-const snapshot = `(() => ({ time: performance.now(), frames: __bench.frames }))()`;
-
 /** Runs an animated scenario and measures the work of its frames. */
 async function measureRuntime(build, target, scenario) {
     const page = await chrome.openPage();
@@ -153,11 +148,11 @@ async function measureRuntime(build, target, scenario) {
 
         const metricsBefore = (await page.send('Performance.getMetrics')).metrics;
         const processesBefore = await processTimes();
-        await page.evaluate('__bench.frameWork = []');
-        const before = await page.evaluate(snapshot);
+        await page.evaluate(startFrameWork);
+        const before = await page.evaluate(frameCount);
         await sleep(measureMs);
-        const after = await page.evaluate(snapshot);
-        const frameWork = await page.evaluate('(() => { const work = __bench.frameWork; __bench.frameWork = null; return work; })()');
+        const after = await page.evaluate(frameCount);
+        const frameWork = await page.evaluate(takeFrameWork);
         const processesAfter = await processTimes();
         const metricsAfter = (await page.send('Performance.getMetrics')).metrics;
 
@@ -225,24 +220,12 @@ async function measureI18n(build, target) {
     }
 }
 
-function log(message) {
-    console.log(`[${new Date().toISOString().slice(11, 19)}] ${message}`);
-}
-
 {
     const page = await chrome.openPage();
-    results.gpu = await page.evaluate(`(() => {
-        const gl = document.createElement('canvas').getContext('webgl2');
-        if (!gl) return 'no WebGL 2';
-        const info = gl.getExtension('WEBGL_debug_renderer_info');
-        return gl.getParameter(info ? info.UNMASKED_RENDERER_WEBGL : gl.RENDERER);
-    })()`);
+    results.gpu = await page.evaluate(gpuName);
     await page.close();
     log(`${results.browser}, GPU: ${results.gpu}`);
 }
-
-/** The builds in the order of repetition [run]: alternating, so neither always goes first. */
-const buildsOf = (run) => (run % 2 === 0 ? builds : [...builds].reverse());
 
 try {
     if (suites.includes('startup')) {
@@ -250,7 +233,7 @@ try {
             const caches = {};
             for (const build of builds) caches[build] = await warmCache(build, target);
             for (let run = 0; run < runs; run++) {
-                for (const build of buildsOf(run)) {
+                for (const build of buildsOf(builds, run)) {
                     const cold = await measureStartup(build, target, { cache: null });
                     const warm = await measureStartup(build, target, { cache: caches[build] });
                     results.startup.push({ build, target, kind: 'cold', ...cold }, { build, target, kind: 'warm', ...warm });
@@ -263,7 +246,7 @@ try {
     if (suites.includes('throttled')) {
         for (const target of targets) {
             for (let run = 0; run < Math.ceil(runs / 2); run++) {
-                for (const build of buildsOf(run)) {
+                for (const build of buildsOf(builds, run)) {
                     const cold = await measureStartup(build, target, { cache: null, throttled: true });
                     results.startup.push({ build, target, kind: 'throttled', ...cold });
                     log(`throttled startup ${target} ${build}: ${cold.firstFrame.toFixed(0)} ms`);
@@ -275,7 +258,7 @@ try {
         for (const target of targets) {
             for (const scenario of animatedScenarios) {
                 for (let run = 0; run < 3; run++) {
-                    for (const build of buildsOf(run)) {
+                    for (const build of buildsOf(builds, run)) {
                         const result = await measureRuntime(build, target, scenario);
                         results.runtime.push(result);
                         log(`${scenario} ${target} ${build}: ${(result.frames / result.seconds).toFixed(0)} fps`);
@@ -293,7 +276,7 @@ try {
         }
         for (const target of targets) {
             for (let run = 0; run < 3; run++) {
-                for (const build of buildsOf(run)) {
+                for (const build of buildsOf(builds, run)) {
                     const result = await measureI18n(build, target);
                     results.i18n.push(result);
                     const bytes = result.network.reduce((sum, entry) => sum + entry.bytes, 0);
@@ -307,7 +290,6 @@ try {
     server.close();
 }
 
-await mkdir(join(projectDir, 'results'), { recursive: true });
-const file = join(projectDir, 'results', `${results.date.replace(/[:.]/g, '-')}.json`);
-await writeFile(file, JSON.stringify(results, null, 2));
+const { file, save } = await resultsFile(results);
+await save();
 log(`Results: ${file}`);

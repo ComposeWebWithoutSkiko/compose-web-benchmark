@@ -24,6 +24,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
@@ -31,7 +32,9 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -43,13 +46,23 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.BlurEffect
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Canvas as ImageCanvas
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.ColorMatrix
+import androidx.compose.ui.graphics.CompositeShader
+import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.GraphicsLayerScope
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.ImageShader
+import androidx.compose.ui.graphics.LinearGradientShader
+import androidx.compose.ui.graphics.Paint
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.Shader
+import androidx.compose.ui.graphics.ShaderBrush
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.TileMode
+import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.layout
@@ -80,29 +93,32 @@ import kotlin.math.sin
 @Composable
 private fun animationTime(): State<Float> {
     val time = remember { mutableFloatStateOf(0f) }
-    LaunchedEffect(Unit) {
-        while (true) {
-            withFrameNanos {
-                time.floatValue += 1f / 60f
-                countFrame()
-            }
-        }
-    }
+    EveryFrame { time.floatValue += 1f / 60f }
     return time
 }
 
 /** Scrolls [listState] by 16px in every frame and counts the frames. */
 @Composable
 private fun ScrollInEveryFrame(listState: LazyListState) {
-    LaunchedEffect(listState) {
+    EveryFrame { listState.dispatchRawDelta(16f) }
+}
+
+/** Calls [onFrame] in every frame, and counts the frames. */
+@Composable
+private fun EveryFrame(onFrame: () -> Unit) {
+    val currentOnFrame by rememberUpdatedState(onFrame)
+    LaunchedEffect(Unit) {
         while (true) {
             withFrameNanos {
-                listState.dispatchRawDelta(16f)
+                currentOnFrame()
                 countFrame()
             }
         }
     }
 }
+
+/** A value that goes from 0 to 1 and back for the card [index] at [time], each card a little after the one before. */
+private fun wave(time: Float, index: Int): Float = abs(sin(time * 2f + index * 0.4f))
 
 /** A typical screen of an app: a list of messages. [scrolling] scrolls it by 16px per frame. */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -192,15 +208,24 @@ internal fun Layers() {
 // Layers that need an offscreen buffer in every frame: cards of several draws (a background and a
 // text), each a layer that changes in every frame.
 
-/** A card: a background of [shape] and a text. */
+/** A card: a background of [shape] and [label], drawn through [labelModifier]. */
 @Composable
-private fun Card(index: Int, modifier: Modifier, shape: Shape = CardShape) {
-    Box(modifier.background(Palette[index % Palette.size], shape).padding(12.dp)) {
-        Text("Card ${index + 1}", color = Color.White, fontWeight = FontWeight.Bold)
+private fun Card(
+    index: Int,
+    modifier: Modifier,
+    shape: Shape = CardShape,
+    label: String = "Card ${index + 1}",
+    labelModifier: Modifier = Modifier,
+) {
+    Box(modifier.background(Palette[index % Palette.size], shape)) {
+        Text(label, labelModifier.padding(12.dp), color = Color.White, fontWeight = FontWeight.Bold)
     }
 }
 
 private val CardShape = RoundedCornerShape(12.dp)
+
+/** Where a card of a grid goes: 196 x 60 dp, 6 dp from the next ones. */
+private val CardSlot = Modifier.padding(6.dp).size(196.dp, 60.dp)
 
 /** [rows] x [columns] items, numbered row by row. */
 @Composable
@@ -214,6 +239,12 @@ private fun Grid(rows: Int, columns: Int, modifier: Modifier = Modifier, item: @
     }
 }
 
+/** [rows] x [columns] cards made by [card], numbered row by row. */
+@Composable
+private fun Cards(rows: Int = 10, columns: Int = 6, card: @Composable (index: Int) -> Unit) {
+    Grid(rows, columns, Modifier.padding(8.dp), card)
+}
+
 /** [rows] x [columns] cards, each a layer set up by [layer] in every frame. */
 @Composable
 private fun CardGrid(
@@ -221,16 +252,14 @@ private fun CardGrid(
     columns: Int = 6,
     layer: GraphicsLayerScope.(index: Int) -> Unit,
 ) {
-    Grid(rows, columns, Modifier.padding(8.dp)) { index ->
-        Card(index, Modifier.padding(6.dp).size(196.dp, 60.dp).graphicsLayer { layer(index) })
-    }
+    Cards(rows, columns) { index -> Card(index, CardSlot.graphicsLayer { layer(index) }) }
 }
 
 /** 60 cards fading in and out: an alpha that can't be applied draw by draw. */
 @Composable
 internal fun Fade() {
     val time by animationTime()
-    CardGrid { index -> alpha = 0.3f + 0.7f * abs(sin(time * 2f + index * 0.4f)) }
+    CardGrid { index -> alpha = 0.3f + 0.7f * wave(time, index) }
 }
 
 /**
@@ -241,13 +270,11 @@ internal fun Fade() {
 @Composable
 internal fun Churn() {
     val time by animationTime()
-    Grid(rows = 10, columns = 6, Modifier.padding(8.dp)) { index ->
+    Cards { index ->
         Box(
-            Modifier
-                .padding(6.dp)
-                .size(196.dp, 60.dp)
+            CardSlot
                 .graphicsLayer {
-                    alpha = 0.3f + 0.7f * abs(sin(time * 2f + index * 0.4f))
+                    alpha = 0.3f + 0.7f * wave(time, index)
                     translationX = sin(time * 3f + index) * 6.3f * density
                     translationY = cos(time * 2f + index) * 4.7f * density
                 }
@@ -271,12 +298,127 @@ internal fun Churn() {
 @Composable
 internal fun Filters() {
     val time by animationTime()
-    val filters = remember {
-        List(16) { level -> ColorFilter.colorMatrix(ColorMatrix().apply { setToSaturation(level / 15f) }) }
-    }
+    val filters = remember { saturationFilters() }
     CardGrid { index ->
-        colorFilter = filters[(abs(sin(time * 2f + index * 0.4f)) * 15).toInt()]
+        colorFilter = filters[saturationLevel(time, index)]
     }
+}
+
+/** The 16 levels of saturation of the cards, from gray to the colors as they are. */
+private fun saturationFilters(): List<ColorFilter> =
+    List(16) { level -> ColorFilter.colorMatrix(ColorMatrix().apply { setToSaturation(level / 15f) }) }
+
+/** The level of saturation of the card [index] at [time], going down and up. */
+private fun saturationLevel(time: Float, index: Int): Int = (wave(time, index) * 15).toInt()
+
+/**
+ * 60 cards filled with a tiled image whose saturation goes down and up (see [BrushCards]): an image
+ * shader through a color filter.
+ */
+@Composable
+internal fun ImageBrush() {
+    BrushCards(remember { checkerBrush() })
+}
+
+/**
+ * 60 cards filled with a gradient whose saturation goes down and up (see [BrushCards]): a gradient
+ * through a color filter.
+ */
+@Composable
+internal fun GradientBrush() {
+    BrushCards(remember { Brush.linearGradient(Palette) })
+}
+
+/**
+ * 60 cards filled with a blend of two gradients whose saturation goes down and up (see
+ * [BrushCards]): a shader that no fill style draws, through a color filter.
+ */
+@Composable
+internal fun CompositeBrush() {
+    BrushCards(
+        remember {
+            object : ShaderBrush() {
+                override fun createShader(size: Size): Shader = CompositeShader(
+                    LinearGradientShader(Offset.Zero, Offset(size.width, 0f), Palette),
+                    LinearGradientShader(Offset.Zero, Offset(0f, size.height), listOf(Color.White, Color.DarkGray)),
+                    BlendMode.Multiply,
+                )
+            }
+        }
+    )
+}
+
+/**
+ * 60 cards with a tiled image drawn over them in soft-light with a paint, its alpha going down and
+ * up: a blend mode that Firefox's accelerated Canvas 2D doesn't draw, reading the canvas back for it.
+ * Haze blends its noise in soft-light through a render effect instead, which the panels of the Haze
+ * app measure (`haze/`).
+ */
+@Composable
+internal fun SoftLight() {
+    val time by animationTime()
+    val noise = remember { checkerBrush() }
+    DrawnCards { index ->
+        drawRect(Palette[index % Palette.size])
+        drawRect(noise, alpha = 0.3f + 0.7f * wave(time, index), blendMode = BlendMode.Softlight)
+    }
+}
+
+/**
+ * The frames in which the texts of [NewContent] are new: past the frames by which the page of the
+ * emote catalog of Emotecraft Library was taken off acceleration as its content came, its 37th, 65th
+ * or 91st in Firefox 159 (see `AtlasPage` in compose-multiplatform-core).
+ */
+private const val NewContentFrames = 120
+
+/**
+ * A list of cards whose texts, each in an offscreen layer as large as its card, are new in each of
+ * its first 120 frames, as the content of an app coming after its start, then scrolled by 16px per
+ * frame: Firefox takes a canvas off acceleration for good once too many of its frames missed its
+ * caches, as the canvas the layers are drawn into does in those frames, where all it draws is new
+ * text.
+ */
+@Composable
+internal fun NewContent() {
+    val listState = rememberLazyListState()
+    val frame = remember { mutableIntStateOf(0) }
+    EveryFrame { if (frame.intValue < NewContentFrames) frame.intValue++ else listState.dispatchRawDelta(16f) }
+    LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
+        items(100_000) { index ->
+            Card(
+                index,
+                Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp).height(64.dp),
+                label = if (frame.intValue < NewContentFrames) "Card ${index + 1}, frame ${frame.intValue}" else "Card ${index + 1}",
+                labelModifier = Modifier.fillMaxSize().graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen },
+            )
+        }
+    }
+}
+
+/** 60 cards filled with [brush], whose saturation goes down and up, through color matrices (16 levels). */
+@Composable
+private fun BrushCards(brush: Brush) {
+    val time by animationTime()
+    val filters = remember { saturationFilters() }
+    DrawnCards { index -> drawRect(brush, colorFilter = filters[saturationLevel(time, index)]) }
+}
+
+/** 60 cards, each drawn by [draw] with its index. */
+@Composable
+private fun DrawnCards(draw: DrawScope.(index: Int) -> Unit) {
+    Cards { index -> Box(CardSlot.drawBehind { draw(index) }) }
+}
+
+/** A 16 x 16 tile of four colors of the palette, repeated. */
+private fun checkerBrush(): Brush {
+    val tile = ImageBitmap(16, 16)
+    val canvas = ImageCanvas(tile)
+    for (i in 0 until 4) {
+        val x = (i % 2) * 8f
+        val y = (i / 2) * 8f
+        canvas.drawRect(x, y, x + 8f, y + 8f, Paint().apply { color = Palette[i] })
+    }
+    return ShaderBrush(ImageShader(tile, TileMode.Repeated, TileMode.Repeated))
 }
 
 /** 24 cards blurred by a changing radius, every other one with its edges clamped. */
@@ -284,7 +426,7 @@ internal fun Filters() {
 internal fun Blur() {
     val time by animationTime()
     CardGrid(rows = 4) { index ->
-        val radius = (2f + 6f * abs(sin(time * 2f + index * 0.4f))) * density
+        val radius = (2f + 6f * wave(time, index)) * density
         renderEffect = BlurEffect(radius, radius, if (index % 2 == 0) TileMode.Clamp else TileMode.Decal)
     }
 }
@@ -306,7 +448,7 @@ internal fun Nested() {
                 Modifier
                     .padding(4.dp)
                     .size(196.dp, 56.dp)
-                    .graphicsLayer { alpha = 0.4f + 0.6f * abs(sin(time * 2f + index * 0.4f)) },
+                    .graphicsLayer { alpha = 0.4f + 0.6f * wave(time, index) },
             )
         }
     }
@@ -349,7 +491,7 @@ internal fun Shadows(cutCorners: Boolean) {
             }
         )
         Grid(rows = 10, columns = 6) { index ->
-            Card(index, Modifier.padding(6.dp).size(196.dp, 60.dp).shadow(6.dp, shape), shape)
+            Card(index, CardSlot.shadow(6.dp, shape), shape)
         }
     }
 }
@@ -363,21 +505,47 @@ internal fun CardScroll() {
         items(100_000) { row ->
             Row {
                 repeat(6) { column ->
-                    Card(row * 6 + column, Modifier.padding(6.dp).size(196.dp, 60.dp).shadow(6.dp, CardShape))
+                    Card(row * 6 + column, CardSlot.shadow(6.dp, CardShape))
                 }
             }
         }
     }
 }
 
-/** 60 fading cards multiplied onto a gradient: a blend mode that needs an offscreen layer. */
+/**
+ * The messages of the inbox in a card with rounded corners, scrolled by 16px per frame: list items
+ * whose backgrounds reach the edges of the card's clip, between their texts.
+ */
 @Composable
-internal fun Blend() {
+internal fun CardList() {
+    val listState = rememberLazyListState()
+    ScrollInEveryFrame(listState)
+    Surface(
+        Modifier.fillMaxSize().padding(24.dp),
+        shape = RoundedCornerShape(24.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+    ) {
+        LazyColumn(state = listState) {
+            items(100_000) { index ->
+                Message(index)
+                HorizontalDivider()
+            }
+        }
+    }
+}
+
+/**
+ * 60 fading cards blended onto a gradient in [blendMode], a blend mode of their layers: one that needs
+ * an offscreen layer, such as multiply; in soft-light, which Firefox's accelerated Canvas 2D doesn't
+ * draw, compositing a layer reads the canvas back there.
+ */
+@Composable
+internal fun Blend(blendMode: BlendMode) {
     val time by animationTime()
     Box(Modifier.fillMaxSize().background(Brush.linearGradient(listOf(Palette[3], Palette[7], Palette[5])))) {
         CardGrid { index ->
-            alpha = 0.6f + 0.4f * abs(sin(time * 2f + index * 0.4f))
-            blendMode = BlendMode.Multiply
+            alpha = 0.6f + 0.4f * wave(time, index)
+            this.blendMode = blendMode
         }
     }
 }

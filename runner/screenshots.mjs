@@ -8,14 +8,16 @@ import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { parseArgs } from 'node:util';
 import { launchChrome } from './chrome.mjs';
+import { animatedScenarioNames, scenarioPath, viewport } from './common.mjs';
 import { projectDir, startServer } from './server.mjs';
 
 const { values: options } = parseArgs({
     options: {
         targets: { type: 'string', default: 'wasmJs,js' },
+        // The animated scenarios but scroll, which is the startup screen scrolled.
         scenarios: {
             type: 'string',
-            default: 'startup,i18n,layers,fade,churn,filters,blur,nested,perspective,elevation,shadows,cutshadows,cardscroll,blend,canvas,text,effects',
+            default: ['startup', 'i18n', ...animatedScenarioNames.filter((name) => name !== 'scroll')].join(','),
         },
     },
 });
@@ -31,8 +33,8 @@ try {
         for (const scenario of scenarios) {
             for (const build of builds) {
                 const page = await chrome.openPage();
-                await page.send('Emulation.setDeviceMetricsOverride', { width: 1280, height: 800, deviceScaleFactor: 2, mobile: false });
-                await page.send('Page.navigate', { url: `${server.origin}/${build}/${target}/index.html?scenario=${scenario}` });
+                await page.send('Emulation.setDeviceMetricsOverride', { ...viewport, mobile: false });
+                await page.send('Page.navigate', { url: server.origin + scenarioPath(build, target, scenario) });
                 await page.waitFor('globalThis.__bench?.firstFrame');
                 // Fonts downloaded on demand get time to arrive.
                 await sleep(scenario === 'i18n' ? 8000 : 1000);
